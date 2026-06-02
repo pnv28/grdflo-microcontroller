@@ -34,6 +34,7 @@ String wifiPassword;
 String username;
 String password;
 u8_t pinOffset;
+u8_t totalPins;
 int *chargePin, *lightPin;
 
 void getDeviceSpecificConfig() {
@@ -51,8 +52,10 @@ void getDeviceSpecificConfig() {
     // note to readers, i did this cause, if pin offset is 4, that means first  4 gpio will be used for charger, and rest 12 will be used for light, if it is 10, then 10 pins charger, last 6 lights, and so on.
     prefs.begin("pinDistribution", true);
     pinOffset = prefs.getUChar("offset", 255);
+    totalPins = prefs.getUChar("totalPin", 255);
     prefs.end();
-    if(ssid.compareTo("readError") == 0 || wifiPassword.compareTo("readError") == 0 || username.compareTo("readError") == 0 || password.compareTo("readError") == 0 || ( pinOffset > 15)) {
+
+    if(ssid.compareTo("readError") == 0 || wifiPassword.compareTo("readError") == 0 || username.compareTo("readError") == 0 || password.compareTo("readError") == 0 || totalPins > 16 || pinOffset > totalPins) {
         Serial.println("Could not, get the appropriate read value from NVS\nRecheck provisioned device specific config\nRebooting...");
         delay(100);
         ESP.restart();
@@ -60,7 +63,7 @@ void getDeviceSpecificConfig() {
     }
 
     chargePin = new int[pinOffset];
-    lightPin = new int[16-pinOffset];
+    lightPin = new int[totalPins - pinOffset];
 
     int counter;
     int i = 0;
@@ -83,7 +86,7 @@ void getDeviceSpecificConfig() {
     }
     i=0;
 
-    for(counter; counter < 81; counter++) {
+    for(counter; counter < (65 + totalPins); counter++) {
         tmp[0] = char(counter);
         tmp[1] = '\0';
         lightPin[i] = prefs.getUChar(tmp, 255);

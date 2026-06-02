@@ -6,7 +6,7 @@
 // GPIO Pin Definition
 #define RED_PIN 20
 #define BLUE_PIN 5
-#define LED_PIN 10 
+#define LED_PIN 10
 
 // Max Segment
 #define MAX_SEGMENT 6
@@ -24,6 +24,7 @@ extern  String username;
 extern  String password;
 
 extern u8_t pinOffset;
+extern u8_t totalPins;
 extern int *chargePin;
 extern int *lightPin;
 
