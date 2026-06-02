@@ -60,7 +60,7 @@ void getDeviceSpecificConfig() {
     }
 
     chargePin = new int[pinOffset];
-    lightPin = new int[15-pinOffset];
+    lightPin = new int[16-pinOffset];
 
     int counter;
     int i = 0;

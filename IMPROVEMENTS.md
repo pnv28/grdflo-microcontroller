@@ -155,43 +155,33 @@ case MQTT_EVENT_ERROR:
 
 ### 6. `lightPin[10]` and `chargePin[10]` are `extern` declared but never defined
 
-**File:** `src/config.h`, lines 25–26
+> fixed
 
-**The problem:**
+**File:** `src/config.h`, `src/config.cpp`
+
+Fixed by replacing the fixed-size `int[10]` arrays with **dynamically allocated pointers**:
 
 ```cpp
-extern int lightPin[10];
-extern int chargePin[10];
+// config.h
+extern int *chargePin;
+extern int *lightPin;
+
+// config.cpp
+chargePin = new int[pinOffset];
+lightPin  = new int[16 - pinOffset];
 ```
 
-These are declared as extern (meaning "defined somewhere else"), but they are never actually defined in `config.cpp` or anywhere else. If any code ever references them, you get a linker error. Currently no code uses them so it compiles — but it's a ticking time bomb as you add code.
-
-**The fix:**
-
-Either add the definitions to `config.cpp`:
-```cpp
-int lightPin[10] = {0};
-int chargePin[10] = {0};
-```
-Or remove the `extern` declarations until you're ready to actually define them.
+A fixed size of `[10]` would have been the wrong approach anyway — the actual number of pins in each group is only known at boot time after reading `pinOffset` from NVS. Dynamic allocation sizes the arrays exactly to what the device needs, with no wasted memory.
 
 ---
 
 ### 7. `LED_PIN` is defined in `cmd.cpp` instead of `config.h`
 
-**File:** `src/cmd.cpp`, line 3
+> fixed
 
-**The problem:**
+**File:** `src/config.h`
 
-```cpp
-#define LED_PIN 10
-```
-
-Every other hardware pin (`RED_PIN`, `BLUE_PIN`) is in `config.h`. `LED_PIN` is defined locally in `cmd.cpp`, which means if you ever reference it from another file, you get an "undeclared identifier" error. Inconsistency here will confuse anyone reading the code.
-
-**The fix:**
-
-Move `#define LED_PIN 10` into `config.h` with the other pin definitions, and remove it from `cmd.cpp`.
+`#define LED_PIN 10` has been moved into `config.h` alongside `RED_PIN` and `BLUE_PIN`, where all hardware pin constants belong.
 
 ---
 
@@ -410,8 +400,8 @@ The `globalErrorCount` mechanism (currently commented out everywhere) was a good
 | 3 | MQTT init return value not checked | `mqttManager.cpp:95` | **Fix now** |
 | 4 | `WiFi.persistent` called after `WiFi.begin` | `initWiFiConnection.cpp:4` | **Fix now** |
 | 5 | MQTT errors log nothing useful | `mqttManager.cpp:70` | Before deployment |
-| 6 | `lightPin/chargePin` declared but not defined | `config.h:25` | Before deployment |
-| 7 | `LED_PIN` not in `config.h` | `cmd.cpp:3` | Before deployment |
+| 6 | `lightPin/chargePin` declared but not defined | `config.h:25` | ~~Before deployment~~ **fixed** |
+| 7 | `LED_PIN` not in `config.h` | `cmd.cpp:3` | ~~Before deployment~~ **fixed** |
 | 8 | `if` chain should be `else if` | `cmd.cpp:8` | Before deployment |
 | 9 | Missing `\n` in heap print | `main.cpp:42` | Before deployment |
 | 10 | `Preferences` should be a local variable | `config.cpp:4` | Before deployment |
