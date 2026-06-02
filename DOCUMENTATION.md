@@ -1,6 +1,6 @@
 # GridFlow Microcontroller Firmware — Documentation
 
-> **Status: Work in progress.** The core WiFi + MQTT infrastructure is functional. The `cmnd`, `stat`, `tele`, and `conf` message handlers are stubs yet to be implemented.
+> **Status: Work in progress.** The core WiFi + MQTT infrastructure is functional. The `cmnd` handler is partially implemented (`charger` and `light` done, `cycle` pending). The `stat`, `tele`, and `conf` message handlers are stubs yet to be implemented.
 
 ---
 
@@ -60,13 +60,13 @@ All three constants are defined in `config.h`. These are fixed indicator and deb
 
 > **GRB quirk (ESP32-C3 only):** The onboard RGB LED on the ESP32-C3-DevKitM-1 uses **GRB** byte order instead of the usual RGB. The `rgbLedWrite()` calls in `cmd.cpp` account for this — the second argument is Green, third is Red, fourth is Blue. The WROVER has no LED connected, so `LED_PIN` and all LED-related code in `cmd.cpp` have no effect on that board for now.
 
-> **Hardware note from the author:** GPIO 21 may have been damaged on the original dev board (`// note i might have fried gpio pin 21`).
+> **Hardware note from pnv:** GPIO 21 may have been damaged on the original dev board (`// note i might have fried gpio pin 21`).
 
 ### Relay Module
 
 The device drives a relay module for controlling charging and lighting circuits. The channels are divided into two groups:
 
-- **Charger pins** (`chargePin[]`) — relay channels that switch EV charging or battery charging circuits.
+- **Charger pins** (`chargerPin[]`) — relay channels that switch EV charging or battery charging circuits.
 - **Light pins** (`lightPin[]`) — relay channels that switch lighting circuits.
 
 The total number of channels physically connected to GPIO (`totalPins`), the charger/light split (`pinOffset`), and the actual GPIO number for each channel are not hardcoded anywhere in the firmware. They are stored in NVS and loaded at boot. This means the supervisor's requirement — that pin count and pin assignments must be configurable without touching the firmware — is fully met. See [Section 5](#5-global-configuration--configh--configcpp) for the complete design.
@@ -118,20 +118,20 @@ grdflo-microcontroller/
 
 ## 4. Build Configuration — `platformio.ini`
 
-Two environments are defined — one per supported board. Activate the one you need by ensuring it is uncommented; comment out the other. Currently the **C3 is commented out and WROVER is active**, but active development is on the C3, so this will likely flip.
+Two environments are defined — one per supported board. Activate the one you need by ensuring it is uncommented; comment out the other. Currently the **C3 is active and the WROVER is commented out**, reflecting active development on the C3.
 
 **ESP32-C3-DevKitM-1 environment (current dev board):**
 ```ini
-; [env:esp32-c3-devkitm-1]
-; platform = https://github.com/pioarduino/platform-espressif32/releases/download/stable/platform-espressif32.zip
-; board = esp32-c3-devkitm-1
-; framework = arduino
-; monitor_speed = 115200
-; board_build.partitions = min_spiffs.csv
-; lib_deps = bblanchon/ArduinoJson@7.4.2
-; build_flags =
-;     -DARDUINO_USB_CDC_ON_BOOT=1
-;     -DARDUINO_USB_MODE=1
+[env:esp32-c3-devkitm-1]
+platform = https://github.com/pioarduino/platform-espressif32/releases/download/stable/platform-espressif32.zip
+board = esp32-c3-devkitm-1
+framework = arduino
+monitor_speed = 115200
+board_build.partitions = min_spiffs.csv
+lib_deps = bblanchon/ArduinoJson@7.4.2
+build_flags =
+    -DARDUINO_USB_CDC_ON_BOOT=1
+    -DARDUINO_USB_MODE=1
 ```
 
 **ESP32 WROVER environment:**
@@ -197,13 +197,13 @@ extern String username;           // Device ID — MQTT client ID and username
 extern String password;           // MQTT password for this device
 extern u8_t pinOffset;            // How many of totalPins are charger channels
 extern u8_t totalPins;            // Total relay channels physically wired to GPIO
-extern int *chargePin;            // Dynamically allocated array of charger relay GPIO numbers
+extern int *chargerPin;           // Dynamically allocated array of charger relay GPIO numbers
 extern int *lightPin;             // Dynamically allocated array of light relay GPIO numbers
 ```
 
 **Why `extern`?** Without it, every `.cpp` file that includes `config.h` would create its own separate copy of each variable — multiple definitions of the same symbol. The linker would either error or silently give each file its own independent variable, meaning changes in one file would not be visible in another. `extern` separates the *declaration* (which goes in the header — "this variable exists somewhere") from the *definition* (which goes in `config.cpp` — "this is the one actual variable in memory"). Every file that includes `config.h` gets a reference to the same single variable defined in `config.cpp`, with no duplication and no wasted memory.
 
-**Why pointers for `chargePin` and `lightPin`?** The size of these arrays is only known at boot time after reading `totalPins` and `pinOffset` from NVS. A fixed-size declaration like `int chargePin[16]` would always allocate 16 integers regardless of how many relay channels are actually connected — wasting memory. Dynamic allocation with `new int[pinOffset]` and `new int[totalPins - pinOffset]` sizes them to exactly what this particular deployment needs.
+**Why pointers for `chargerPin` and `lightPin`?** The size of these arrays is only known at boot time after reading `totalPins` and `pinOffset` from NVS. A fixed-size declaration like `int chargerPin[16]` would always allocate 16 integers regardless of how many relay channels are actually connected — wasting memory. Dynamic allocation with `new int[pinOffset]` and `new int[totalPins - pinOffset]` sizes them to exactly what this particular deployment needs.
 
 ### `config.cpp` — Definitions and NVS Loading
 
@@ -317,8 +317,8 @@ if(ssid.compareTo("readError") == 0 || wifiPassword.compareTo("readError") == 0 
 **Step 4 — Dynamic array allocation**
 
 ```cpp
-chargePin = new int[pinOffset];
-lightPin  = new int[totalPins - pinOffset];
+chargerPin = new int[pinOffset];
+lightPin   = new int[totalPins - pinOffset];
 ```
 
 Arrays are sized at runtime to exactly what this deployment needs. A unit with `totalPins = 4` and `pinOffset = 2` allocates 4 integers total — 2 for chargers, 2 for lights — nothing wasted.
@@ -336,9 +336,10 @@ char tmp[2] = {0};
 for(counter = 65; counter < (65 + pinOffset); counter++) {
     tmp[0] = (char)counter;
     tmp[1] = '\0';
-    chargePin[i] = prefs.getUChar(tmp, 255);
+    chargerPin[i] = prefs.getUChar(tmp, 255);
 
-    if(chargePin[i] == 255) { ... ESP.restart(); }
+    if(chargerPin[i] == 255) { ... ESP.restart(); }
+    pinMode(chargerPin[i], OUTPUT);
     i++;
 }
 i = 0;
@@ -350,6 +351,7 @@ for(counter; counter < (65 + totalPins); counter++) {
     lightPin[i] = prefs.getUChar(tmp, 255);
 
     if(lightPin[i] == 255) { ... ESP.restart(); }
+    pinMode(lightPin[i], OUTPUT);
     i++;
 }
 
@@ -366,7 +368,7 @@ The actual GPIO numbers for each relay channel are stored in NVS under single-ch
 
 | NVS Key range | Maps to | Contains |
 |---|---|---|
-| `"A"` to key at `64 + pinOffset` | `chargePin[0]` … `chargePin[pinOffset-1]` | GPIO numbers for charger relays |
+| `"A"` to key at `64 + pinOffset` | `chargerPin[0]` … `chargerPin[pinOffset-1]` | GPIO numbers for charger relays |
 | Key at `65 + pinOffset` to key at `64 + totalPins` | `lightPin[0]` … `lightPin[totalPins-pinOffset-1]` | GPIO numbers for light relays |
 
 If any key returns the sentinel `255` (meaning the key doesn't exist), the device reboots. A partially provisioned pin map would silently drive the wrong GPIO pins — hard rebooting is far safer.
@@ -676,15 +678,31 @@ void conf (char *segment[], const size_t seg_len, const char *payload);
 
 ### `cmnd/cmnd.cpp`
 
-Currently an **empty stub**. The planned topic structure for `cmnd` is:
+Partially implemented. The topic structure for `cmnd` is:
 
 ```
-cmnd/<device_id>/(charge|light)/<channelID>
+cmnd/<device_id>/(charger|light)/<channelID>
 ```
 
-`segment[2]` selects the relay group (`charge` or `light`). `segment[3]` is the zero-based channel index within that group — `0` through `pinOffset-1` for chargers, `0` through `totalPins-pinOffset-1` for lights.
+`segment[2]` selects the relay group (`charger` or `light`). `segment[3]` is the zero-based channel index within that group — `0` through `pinOffset-1` for chargers, `0` through `totalPins-pinOffset-1` for lights. The payload is `1` (relay HIGH) or `0` (relay LOW).
 
-Example: `cmnd/GF-B1/charge/1` with payload `ON` should close charger relay 1 — i.e., set `chargePin[1]` HIGH.
+`cmnd()` routes to one of two internal functions:
+
+**`charger(int chargerID, bool state)`**
+- Bounds-checks `chargerID >= pinOffset` and returns `-1` if out of range.
+- Calls `digitalWrite(chargerPin[chargerID], HIGH/LOW)` based on `state`.
+- Returns `0` on success.
+
+**`light(int lightID, bool state)`**
+- Bounds-checks `lightID >= (totalPins - pinOffset)` and returns `-1` if out of range.
+- Calls `digitalWrite(lightPin[lightID], HIGH/LOW)` based on `state`.
+- Returns `0` on success.
+
+Both `segment[3]` and `payload` are passed through `atoi()` at the call site — `segment[3]` is the channel index as a string (e.g., `"2"`), and `payload` is `"1"` or `"0"`. `atoi()` converts both to integers; the integer `0`/`1` then implicitly converts to `bool` for the `state` parameter.
+
+Example: `cmnd/GF-B1/charger/1` with payload `1` closes charger relay 1 — sets `chargerPin[1]` HIGH.
+
+**`cycle(unsigned int timeInSeconds)`** — forward-declared but not yet implemented. Intended to turn a relay on for a set duration then off automatically.
 
 ### `conf/conf.cpp`
 
@@ -742,7 +760,7 @@ This is an **earlier, simpler command handler** that predates the structured `cm
 │    │       pinOffset (how many of those are chargers)      │
 │    │     namespace "pinMapping"                            │
 │    │       keys "A"–"A+totalPins-1"                        │
-│    │       → chargePin[pinOffset]        (heap-allocated)  │
+│    │       → chargerPin[pinOffset]       (heap-allocated)  │
 │    │       → lightPin[totalPins-pinOffset](heap-allocated) │
 │    │                                                       │
 │    ├─ initWiFiConnection()           ← 2.4 GHz WiFi        │
@@ -771,7 +789,7 @@ This is an **earlier, simpler command handler** that predates the structured `cm
 │         ├─ guard: tokenCount < 3 → return                  │
 │         ├─ verify segment[1] == username                   │
 │         └─ route by segment[0]:   [ALL COMMENTED OUT]      │
-│              ├─ "cmnd" → cmnd()   [STUB]                   │
+│              ├─ "cmnd" → cmnd()   [IMPLEMENTED]             │
 │              ├─ "stat" → stat()   [NOT IMPL]               │
 │              ├─ "tele" → tele()   [NOT IMPL]               │
 │              └─ "conf" → conf()   [NOT WIRED YET]          │
@@ -859,18 +877,18 @@ index:      0       1          2         3
 
 So `segment[0]` = root, `segment[1]` = device ID, `segment[2+]` = action-specific path.
 
-### `cmnd` topic structure (planned)
+### `cmnd` topic structure
 
 ```
-cmnd/<device_id>/(charge|light)/<channelID>
+cmnd/<device_id>/(charger|light)/<channelID>
 ```
 
 | Topic | Direction | Meaning |
 |-------|-----------|---------|
-| `cmnd/GF-B1/charge/0` | Cloud → Device | Control charger relay 0 |
-| `cmnd/GF-B1/charge/1` | Cloud → Device | Control charger relay 1 |
-| `cmnd/GF-B1/light/0`  | Cloud → Device | Control light relay 0 |
-| `cmnd/GF-B1/light/1`  | Cloud → Device | Control light relay 1 |
+| `cmnd/GF-B1/charger/0` | Cloud → Device | Control charger relay 0 |
+| `cmnd/GF-B1/charger/1` | Cloud → Device | Control charger relay 1 |
+| `cmnd/GF-B1/light/0`   | Cloud → Device | Control light relay 0 |
+| `cmnd/GF-B1/light/1`   | Cloud → Device | Control light relay 1 |
 
 ### `stat`, `tele`, `conf` topic structure (not yet designed)
 
@@ -888,7 +906,7 @@ Sub-topic levels for these three namespaces will be defined when the handlers ar
 
 | Component | File | Status | Notes |
 |-----------|------|--------|-------|
-| `cmnd` handler | `src/functions/cmnd/cmnd.cpp` | Empty stub | Function signature exists, body is empty |
+| `cmnd` handler — `cycle()` | `src/functions/cmnd/cmnd.cpp` | Partial | `charger()` and `light()` implemented; `cycle()` forward-declared, not yet implemented |
 | `stat` handler | `src/functions/stat/` | Header only | No `.cpp` file; topic structure not yet designed |
 | `tele` handler | `src/functions/tele/` | Header only | No `.cpp` file; sensors not yet connected |
 | `conf` handler | `src/functions/conf/conf.cpp` | Empty stub | Function signature exists, body is empty |

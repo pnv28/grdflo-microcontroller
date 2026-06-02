@@ -35,7 +35,7 @@ String username;
 String password;
 u8_t pinOffset;
 u8_t totalPins;
-int *chargePin, *lightPin;
+int *chargerPin, *lightPin;
 
 void getDeviceSpecificConfig() {
     Preferences prefs;
@@ -62,7 +62,7 @@ void getDeviceSpecificConfig() {
 
     }
 
-    chargePin = new int[pinOffset];
+    chargerPin = new int[pinOffset];
     lightPin = new int[totalPins - pinOffset];
 
     int counter;
@@ -74,13 +74,15 @@ void getDeviceSpecificConfig() {
     for(counter = 65; counter < (65+pinOffset); counter++) {
         tmp[0] = (char)counter;
         tmp[1] = '\0';
-        chargePin[i] = prefs.getUChar(tmp, 255);
+        chargerPin[i] = prefs.getUChar(tmp, 255);
 
-        if(chargePin[i] == 255) {
+        if(chargerPin[i] == 255) {
             Serial.println("Could not, get the appropriate read value from NVS\nRecheck provisioned device specific config\nRebooting...");
             delay(100);
             ESP.restart();
         }
+
+        pinMode(chargerPin[i], OUTPUT);
 
         i++;
     }
@@ -96,6 +98,8 @@ void getDeviceSpecificConfig() {
             delay(100);
             ESP.restart();
         }
+
+        pinMode(lightPin[i], OUTPUT);
 
         i++;
     }
