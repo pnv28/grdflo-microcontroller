@@ -1,8 +1,6 @@
 #include "config.h"
 #include <Preferences.h>
 
-Preferences prefs;
-
 const char* ca_cert = "-----BEGIN CERTIFICATE-----\n"
 "MIIDVTCCAj2gAwIBAgIUPvVD1r0tzEn/Ha5rRQ3uNTuDAlwwDQYJKoZIhvcNAQEL\n"
 "BQAwOjELMAkGA1UEBhMCTlAxETAPBgNVBAoMCEdyaWRGbG93MRgwFgYDVQQDDA9H\n"
@@ -38,6 +36,7 @@ String password;
 
 
 void getDeviceSpecificConfig() {
+    Preferences prefs;
     prefs.begin("creds", true);
 
     ssid = prefs.getString("wifi_ssid", "readError");

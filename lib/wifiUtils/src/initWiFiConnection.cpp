@@ -1,9 +1,9 @@
 #include "wifiUtils.h"
 
 void initWiFiConnection(const char *ssid, const char *password) {
-    WiFi.begin(ssid, password);
     WiFi.setAutoReconnect(true);
     WiFi.persistent(false);
+    WiFi.begin(ssid, password);
     Serial.println("Trying to connect to WiFi");
     int attempts = 0;
     while (WiFi.status() != WL_CONNECTED && attempts < 20) {
