@@ -53,9 +53,13 @@ static void mqtt_event_handler(void* handler_args, esp_event_base_t base, int32_
       memcpy(payload, event->data, event->data_len);
       payload[event->data_len] = '\0';
 
-      // if(strcmp(segment[0], "cmnd") == 0) cmnd(segment, tokenCount, payload);
-      // if(strcmp(segment[0], "stat") == 0) stat(segment, tokenCount, payload);
-      // if(strcmp(segment[0], "tele") == 0) tele(segment, tokenCount, payload);
+      if(strcmp(segment[1], username.c_str()) == 0) {
+        // if(strcmp(segment[0], "cmnd") == 0) cmnd(segment, tokenCount, payload);
+        // if(strcmp(segment[0], "stat") == 0) stat(segment, tokenCount, payload);
+        // if(strcmp(segment[0], "tele") == 0) tele(segment, tokenCount, payload);
+      } else {
+        Serial.println("Client ID Mismatch");
+      }
 
       // cmd(payload);
 
