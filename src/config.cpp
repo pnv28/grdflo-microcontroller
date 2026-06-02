@@ -33,7 +33,7 @@ String ssid;
 String wifiPassword;
 String username;
 String password;
-
+u8_t pinOffset;
 
 void getDeviceSpecificConfig() {
     Preferences prefs;
@@ -46,11 +46,11 @@ void getDeviceSpecificConfig() {
 
     prefs.end();
 
+    prefs.begin("pinDistribution", true);
+    pinOffset = prefs.getChar("offset", 255);
+    prefs.end();
 
-    
-
-
-    if(ssid.compareTo("readError") == 0 || wifiPassword.compareTo("readError") == 0 || username.compareTo("readError") == 0 || password.compareTo("readError") == 0) {
+    if(ssid.compareTo("readError") == 0 || wifiPassword.compareTo("readError") == 0 || username.compareTo("readError") == 0 || password.compareTo("readError") == 0 || pinOffset == 255) {
         Serial.println("Could not, get the appropriate read value from NVS\nRecheck provisioned device specific config\nRebooting...");
         delay(100);
         ESP.restart();
