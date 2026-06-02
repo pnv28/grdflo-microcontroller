@@ -24,8 +24,8 @@ extern  String username;
 extern  String password;
 
 extern u8_t pinOffset;
-// extern int lightPin[10];
-// extern int chargePin[10];
+extern int *chargePin;
+extern int *lightPin;
 
 void getDeviceSpecificConfig();
 

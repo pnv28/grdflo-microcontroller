@@ -34,6 +34,7 @@ String wifiPassword;
 String username;
 String password;
 u8_t pinOffset;
+int *chargePin, *lightPin;
 
 void getDeviceSpecificConfig() {
     Preferences prefs;
@@ -46,15 +47,55 @@ void getDeviceSpecificConfig() {
 
     prefs.end();
 
+    // due to  the  required needs the offset will be from 0 to 15 only
+    // note to readers, i did this cause, if pin offset is 4, that means first  4 gpio will be used for charger, and rest 12 will be used for light, if it is 10, then 10 pins charger, last 6 lights, and so on.
     prefs.begin("pinDistribution", true);
-    pinOffset = prefs.getChar("offset", 255);
+    pinOffset = prefs.getUChar("offset", 255);
     prefs.end();
-
-    if(ssid.compareTo("readError") == 0 || wifiPassword.compareTo("readError") == 0 || username.compareTo("readError") == 0 || password.compareTo("readError") == 0 || pinOffset == 255) {
+    if(ssid.compareTo("readError") == 0 || wifiPassword.compareTo("readError") == 0 || username.compareTo("readError") == 0 || password.compareTo("readError") == 0 || ( pinOffset > 15)) {
         Serial.println("Could not, get the appropriate read value from NVS\nRecheck provisioned device specific config\nRebooting...");
         delay(100);
         ESP.restart();
 
     }
 
+    chargePin = new int[pinOffset];
+    lightPin = new int[15-pinOffset];
+
+    int counter;
+    int i = 0;
+
+    prefs.begin("pinMapping", true);
+
+    char tmp[2] = {0};
+    for(counter = 65; counter < (65+pinOffset); counter++) {
+        tmp[0] = (char)counter;
+        tmp[1] = '\0';
+        chargePin[i] = prefs.getUChar(tmp, 255);
+
+        if(chargePin[i] == 255) {
+            Serial.println("Could not, get the appropriate read value from NVS\nRecheck provisioned device specific config\nRebooting...");
+            delay(100);
+            ESP.restart();
+        }
+
+        i++;
+    }
+    i=0;
+
+    for(counter; counter < 81; counter++) {
+        tmp[0] = char(counter);
+        tmp[1] = '\0';
+        lightPin[i] = prefs.getUChar(tmp, 255);
+
+        if(lightPin[i] == 255) {
+            Serial.println("Could not, get the appropriate read value from NVS\nRecheck provisioned device specific config\nRebooting...");
+            delay(100);
+            ESP.restart();
+        }
+
+        i++;
+    }
+
+    prefs.end();
 }
