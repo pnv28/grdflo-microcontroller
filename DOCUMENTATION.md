@@ -1,8 +1,8 @@
 # GridFlow Microcontroller Firmware — Documentation
 
-> **Status: Work in progress.** The core WiFi + MQTT infrastructure is functional. The `cmnd` handler is partially implemented (`charger` and `light` done, `cycle` pending). The `stat`, `tele`, and `conf` message handlers are stubs yet to be implemented.
+> **Status: Functional, with `tele` and a few hardening items outstanding.** The WiFi + TLS-MQTT infrastructure is live, the structured `MQTT_EVENT_DATA` router is active, and the `cmnd`, `conf`, and `stat` namespaces are all wired in. `cmnd` covers `charger`, `light`, and `cycle`; `conf` covers `health`, `state`, `reboot`, and `edit` (currently only the `creds` NVS namespace is writable); `stat` is publish-only and exposes `statHealth()` / `statState()` / `statAck()`. Periodic `statHealth()` runs from the 60 s `loop()` heartbeat; every actioned `cmnd` and every `conf/edit` publishes a `stat/<dev>/ack`. Outstanding: `tele` is still a header-only stub (no sensors connected), automatic `statState()` on relay change is not wired, and several smaller items are listed in [Section 14](#14-what-is-not-yet-implemented).
 >
-> **Current dev-time behaviour:** Inside `MQTT_EVENT_DATA`, both the topic tokenisation block and the routed dispatch into `cmnd/stat/tele/conf` are presently commented out. Every incoming message is instead forwarded to the legacy `cmd(payload)` debug handler in `src/cmd.cpp`. The structured routing code stays in the file (alongside the `tokenCount < 3` guard) and is intended to be re-enabled once the handler set is finalised.
+> **Current dev-time behaviour:** Inside `MQTT_EVENT_DATA` the topic is tokenised on `/` into `segment[]` (guard `tokenCount < 3`), the device-ID is verified against `username`, and dispatch runs on `segment[0]` — `cmnd → cmnd()` and `conf → conf()`. The broker subscriptions established in `MQTT_EVENT_CONNECTED` are `cmnd/<username>/#` and `conf/<username>/#`, both at QoS 2. The legacy `cmd(payload)` debug handler in `src/cmd.cpp` is no longer reached — the call site inside `MQTT_EVENT_DATA` is wrapped in a `/* … */` block and retained only as a marker that the path was deliberately retired.
 
 ---
 
@@ -96,14 +96,15 @@ grdflo-microcontroller/
 │   └── functions/                  # Handlers for each MQTT root topic
 │       ├── cmnd/
 │       │   ├── cmnd.h              # cmnd() + charger() declarations, extern cycleID
-│       │   └── cmnd.cpp            # charger/light/cycle relay control + cycle globals
+│       │   └── cmnd.cpp            # charger/light/cycle relay control + cycle globals + ack on exit
 │       ├── stat/
-│       │   └── stat.h              # Declaration for stat() handler — no .cpp yet
+│       │   ├── stat.h              # statHealth() / statAck() / statState() declarations
+│       │   └── stat.cpp            # JSON publishers — device → cloud, retained where appropriate
 │       ├── tele/
 │       │   └── tele.h              # Declaration for tele() handler — no .cpp yet
 │       └── conf/
 │           ├── conf.h              # Declaration for conf() handler
-│           └── conf.cpp            # [STUB] Empty body; not yet wired into mqttManager
+│           └── conf.cpp            # health/state/reboot read commands + edit (NVS write) + ack
 │
 ├── lib/                            # Project-private libraries (compiled separately by PlatformIO)
 │   └── wifiUtils/
@@ -205,6 +206,7 @@ extern u8_t pinOffset;                 // How many of totalPins are charger chan
 extern u8_t totalPins;                 // Total relay channels physically wired to GPIO
 extern int *chargerPin;                // Dynamically allocated array of charger relay GPIO numbers
 extern int *lightPin;                  // Dynamically allocated array of light relay GPIO numbers
+extern int *relayState;                // Dynamically allocated mirror of current relay levels (0/1)
 
 extern unsigned long cycleInterval;    // Cycle-command duration in ms (set by cycle())
 extern unsigned long cycleStart;       // millis() timestamp when cycle was armed
@@ -215,7 +217,9 @@ extern bool cycleFlag;                 // true while a cycle is in flight
 
 **Where the definitions actually live.** Most of these globals are defined in `config.cpp`. The three cycle-related globals — `cycleInterval`, `cycleStart`, `cycleFlag` — are defined in `src/functions/cmnd/cmnd.cpp` alongside the `cycle()` function that owns them. They are still declared `extern` in `config.h` so `main.cpp` can read them in `loop()`. There is also a `cycleID` integer (the charger index currently being cycled) declared `extern` in `cmnd.h` and defined in `cmnd.cpp` — kept out of `config.h` because only `cmnd.cpp` and the loop's cycle-watcher need it.
 
-**Why pointers for `chargerPin` and `lightPin`?** The size of these arrays is only known at boot time after reading `totalPins` and `pinOffset` from NVS. A fixed-size declaration like `int chargerPin[16]` would always allocate 16 integers regardless of how many relay channels are actually connected — wasting memory. Dynamic allocation with `new int[pinOffset]` and `new int[totalPins - pinOffset]` sizes them to exactly what this particular deployment needs.
+**Why pointers for `chargerPin`, `lightPin`, and `relayState`?** The size of these arrays is only known at boot time after reading `totalPins` and `pinOffset` from NVS. A fixed-size declaration like `int chargerPin[16]` would always allocate 16 integers regardless of how many relay channels are actually connected — wasting memory. Dynamic allocation with `new int[pinOffset]`, `new int[totalPins - pinOffset]`, and `new int[totalPins]()` sizes them to exactly what this particular deployment needs.
+
+**`relayState` layout.** `relayState[0 .. pinOffset-1]` mirrors the chargers (same index as the channel ID in `cmnd/<dev>/charger/<i>`). `relayState[pinOffset .. totalPins-1]` mirrors the lights (with a `pinOffset` offset to translate `lightID` → mirror index). The allocation uses `new int[totalPins]()` — the trailing `()` value-initialises every element to 0, so all relays start as OFF in the mirror at boot. Writes happen inside `charger()` and `light()` immediately after each `digitalWrite`, so the mirror cannot drift out of sync with the actual GPIO levels (assuming no external code drives those pins). `statState()` reads from this mirror, so it does not need to call `digitalRead` 16 times to publish the snapshot.
 
 ### `config.cpp` — Definitions and NVS Loading
 
@@ -453,7 +457,7 @@ void loop() {
     if(globalErrorCounter >= 5) {
       ESP.restart();
     }
-
+    statHealth();
     checkWiFiStatus(ssid.c_str(), wifiPassword.c_str());
   }
 }
@@ -463,7 +467,7 @@ The `millis()` / timestamp pattern is a **non-blocking interval timer** — it a
 
 **Cycle re-enable block.** `cycleFlag` is set by `cycle()` in `cmnd.cpp` when a cycle command arrives. `cycle()` turns the targeted charger OFF, records `cycleStart = millis()` and the requested duration `cycleInterval` (in ms), and remembers which charger via `cycleID`. The loop then watches that timestamp: when `currMillis - cycleStart >= cycleInterval`, the charger is turned back ON and the flag is cleared. Unsigned subtraction makes this rollover-safe past the 49-day `millis()` wrap. Only one cycle can be in flight at a time — see [Section 9](#9-topic-routing--srcfunctions).
 
-**60-second heartbeat.** Every minute the loop prints free heap (slow memory-leak detection), checks the error-counter budget, and calls `checkWiFiStatus()` to recover from WiFi loss.
+**60-second heartbeat.** Every minute the loop prints free heap (slow memory-leak detection), checks the error-counter budget, publishes a `statHealth()` snapshot to `stat/<dev>/health` (retained, QoS 2 — see [Section 9](#statstatcpp)), and calls `checkWiFiStatus()` to recover from WiFi loss. The retained health publish means a dashboard subscribing mid-stream immediately sees the latest snapshot; the periodic re-publish gives the cloud a continuous time-series for trending heap leaks, RSSI drift, and accumulating MQTT errors.
 
 **Error-counter reboot.** `globalErrorCounter` is incremented from `MQTT_EVENT_ERROR` in the MQTT task and reset to 0 from `MQTT_EVENT_CONNECTED`. If it crosses the threshold of 5 between two heartbeat ticks without a successful reconnect resetting it, the device hard-reboots via `ESP.restart()`. This is the application-layer self-recovery for cases where the MQTT client is producing errors but the WiFi link itself looks healthy.
 
@@ -737,25 +741,27 @@ cmnd/<device_id>/charger/<channelID>/cycle            # timed off-then-on
 
 `segment[2]` selects the relay group (`charger` or `light`). `segment[3]` is the zero-based channel index within that group — `0` through `pinOffset-1` for chargers, `0` through `totalPins-pinOffset-1` for lights. `segment[4]`, when present, selects a sub-command (currently only `cycle`).
 
-`cmnd()` dispatches to one of three internal functions:
+`cmnd()` has its own `seg_len < 4` guard at the top — every routed path needs `segment[3]`, and the broker-level guard in `mqttManager.cpp` is now relaxed to `< 3` (to allow 3-segment `conf/<dev>/health` etc. through to the conf handler). The handler then dispatches to one of three internal functions, captures the integer return status, and publishes a single ack to `stat/<dev>/ack` summarising the result.
 
 **`charger(int chargerID, bool state)`**
 - Bounds-checks `chargerID >= pinOffset` and returns `-1` if out of range.
 - Calls `digitalWrite(chargerPin[chargerID], HIGH/LOW)` based on `state`.
-- Logs `Charger <id> (GPIO <n>) -> ON/OFF` to serial for every transition.
+- Updates the state mirror: `relayState[chargerID] = state ? 1 : 0`.
+- Logs `Charger <id> (GPIO <n>) -> ON/OFF` to serial.
 - Returns `0` on success.
 
 **`light(int lightID, bool state)`**
 - Bounds-checks `lightID >= (totalPins - pinOffset)` and returns `-1` if out of range.
 - Calls `digitalWrite(lightPin[lightID], HIGH/LOW)` based on `state`.
-- Logs `Light <id> (GPIO <n>) -> ON/OFF` to serial for every transition.
+- Updates the state mirror: `relayState[pinOffset + lightID] = state ? 1 : 0` (lights live in the second half of `relayState[]`).
+- Logs `Light <id> (GPIO <n>) -> ON/OFF`.
 - Returns `0` on success.
 
 Both `segment[3]` and `payload` are passed through `atoi()` at the call site — `segment[3]` is the channel index as a string (e.g., `"2"`), and `payload` is `"1"` or `"0"`. `atoi()` converts both to integers; the integer `0`/`1` then implicitly converts to `bool` for the `state` parameter.
 
 > **Payload caveat:** `atoi()` returns 0 for any non-numeric string. So `"1"` → ON, `"0"` → OFF, but `"ON"` / `"OFF"` / `"on"` / `"off"` all parse as 0 and turn the relay OFF. Use numeric payloads only, or replace the `atoi()` parse with `strcmp()` / JSON if word-form payloads need to be supported.
 
-Example: `cmnd/GF-B1/charger/1` with payload `1` closes charger relay 1 — sets `chargerPin[1]` HIGH.
+Example: `cmnd/GF-B1/charger/1` with payload `1` closes charger relay 1 — sets `chargerPin[1]` HIGH, sets `relayState[1] = 1`, then publishes `stat/GF-B1/ack` with `{"topic":"cmnd/GF-B1/charger/1","ok":true,"t":<ms>}`.
 
 **`cycle(unsigned int timeInSeconds, char *segment[])`** — timed off-then-on cycle for one charger channel. Used to drop and re-energise a charger after a fixed delay (e.g. to reset a downstream device or to throttle current draw).
 
@@ -763,27 +769,85 @@ Example: `cmnd/GF-B1/charger/1` with payload `1` closes charger relay 1 — sets
 - Payload: integer **seconds** (the delay between off and re-on). The payload is multiplied by 1000 to give the internal `cycleInterval` in ms.
 
 The arming sequence inside `cycle()`:
-1. Set `cycleFlag = true`.
-2. Immediately call `charger(chargerID, false)` to drop the relay.
-3. Record `cycleID = chargerID` and `cycleStart = millis()`.
+1. Parse `chargerID` from `segment[3]`.
+2. Call `charger(chargerID, false)` to drop the relay. **If this returns non-zero (bad chargerID), return early with that status** — the cycle is not armed and the eventual ack will be `ok:false`.
+3. Set `cycleFlag = true`, record `cycleID = chargerID`, `cycleStart = millis()`, `cycleInterval = timeInSeconds * 1000`.
 4. Log `Cycle started: charger <id>, interval <ms> ms`.
+5. Return `0`.
 
 The re-enable happens **outside** this function, in `main.cpp`'s `loop()`. The loop watches `cycleFlag` and, when `millis() - cycleStart >= cycleInterval`, re-energises the charger via `charger(cycleID, true)` and clears the flag. This split keeps `cycle()` non-blocking — the MQTT task returns immediately and the watchdog is unaffected even for long cycle durations.
+
+Note: the ack for a cycle command means **"cycle armed successfully"**, not "cycle completed". The re-energise log line (`Cycle fired: charger N re-enabling after <ms> ms`) is the observable signal that the timer fired.
 
 Constraints to know about:
 - **One cycle at a time.** `cycleFlag` / `cycleID` / `cycleStart` / `cycleInterval` are scalars, so a second cycle command (on any charger) while a first is in flight overwrites the first one's bookkeeping — the first charger never gets re-enabled. If concurrent cycles per channel are ever needed, these globals have to become per-channel arrays.
 - **Cycle is only valid for chargers**, not lights. Sending `cmnd/<dev>/light/<id>/cycle` does not match the dispatch.
 - **Guard tightness.** The handler accepts the cycle path when `seg_len >= 5`. A malformed `cmnd/<dev>/charger/<id>/cycle` with no payload (or a non-numeric payload) parses to a 0-ms cycle, which the loop will fire on the very next iteration — visible as an off-then-on flicker.
 
+**Ack flow.** Whatever path the dispatcher takes (charger / light / cycle), `cmnd()` ends with a single call:
+```cpp
+statAck(segment, seg_len, status == 0);
+```
+The `(segment, seg_len)` overload of `statAck()` rebuilds the original topic from the still-valid segment pointers (the `strtok_r` mutilation only consumed the slash bytes), so the ack body always names the exact topic that was acted on. Topics that don't match any branch (`segment[2]` neither `"charger"` nor `"light"`) return early **without** acking, on the principle that you don't want to confirm a topic the firmware silently dropped.
+
 ### `conf/conf.cpp`
 
-Currently an **empty stub**. Intended for runtime configuration changes — for example, updating pin assignments or the charger/light split without re-flashing NVS.
+`conf` is the cloud-to-device control channel for things that aren't relay toggles: status pulls, runtime config edits, and operational commands like reboot. The topic structures:
 
-> **Note on future sensor support:** When physical sensors are added to the device, their GPIO pin assignments will likely need to be added to the NVS provisioning system similarly to how `chargerPin` and `lightPin` are handled today. The `conf` handler and `getDeviceSpecificConfig()` will both need extending at that point.
+```
+conf/<device_id>/health                                # request → device publishes stat/<id>/health
+conf/<device_id>/state                                 # request → device publishes stat/<id>/state
+conf/<device_id>/reboot                                # ESP.restart()
+conf/<device_id>/edit/<namespace>/<key>     payload=<value>   # NVS write, then ack
+```
 
-### `stat/stat.h` and `tele/tele.h`
+The handler has its own `seg_len < 3` guard at entry (all four subcommands need at least `conf/<dev>/<sub>`), then dispatches on `segment[2]`:
 
-Both are **header-only declarations** with no `.cpp` implementation files yet. The sub-topic structures for these namespaces have not been designed yet and will be defined when the handlers are implemented.
+- **`"health"`** → calls `statHealth()`. The retained `stat/<dev>/health` publish *is* the response — no separate ack.
+- **`"state"`** → calls `statState()`. Same pattern — the retained state snapshot is the response.
+- **`"reboot"`** → calls `ESP.restart()`. The device will not get a chance to ack; the cloud-side signal that the reboot worked is the next `MQTT_EVENT_CONNECTED` and the corresponding "Online" publish.
+- **`"edit"`** → checks `seg_len >= 5`, then writes `payload` to NVS namespace `segment[3]`, key `segment[4]` (currently only the `creds` namespace is wired up, using `Preferences::putString`). The handler only writes if `pref.isKey()` confirms the key already exists — this prevents accidentally creating arbitrary NVS keys via a typo. Returns `ok = true` if both the namespace match and the key check pass, then publishes `stat/<dev>/ack` summarising the result.
+
+Example: `conf/GF-B1/edit/creds/wifi_pass` with payload `"NewPassword"` updates the WiFi password in NVS and acks. The change does **not** take effect until the next reboot — `WiFi.begin()` is only called from `setup()`. Pairing it with `conf/GF-B1/reboot` is the way to roll out a live credential change.
+
+> **Security note.** `conf/edit` can rewrite WiFi credentials, MQTT password, and device ID via NVS. The broker ACL on `conf/<dev>/edit/#` needs to be considerably tighter than the ACL on `cmnd/<dev>/#` — only operators with rotation privileges should be able to publish there. Read-only operators only need publish access to `conf/<dev>/health` and `conf/<dev>/state`.
+
+### `stat/stat.cpp`
+
+`stat` is the device-to-cloud publish channel. The handler file is not invoked from `mqtt_event_handler` (stat is publish-only — see the architecture diagram in [Section 11](#11-architecture--how-it-all-fits-together)); it instead exposes three functions called by `cmnd()`, `conf()`, and (eventually) the `loop()` heartbeat.
+
+| Function | Topic | QoS | Retain | Caller |
+|---|---|---|---|---|
+| `statHealth()` | `stat/<dev>/health` | 2 | yes | 60 s `loop()` heartbeat; on-demand via `conf/<dev>/health` |
+| `statState()` | `stat/<dev>/state` | 2 | yes | `conf/<dev>/state` request; planned: every relay change |
+| `statAck(...)` | `stat/<dev>/ack` | 2 | no | every `cmnd` and every `conf/edit` |
+
+**Retain choices:**
+- `health` and `state` are **retained** so a freshly-subscribing dashboard immediately sees the latest snapshot without waiting for the next publish.
+- `ack` is **not retained** because each ack describes a one-shot event in the past — a new subscriber being greeted by an hour-old ack would be misleading.
+
+**Payload schemas** (built via `snprintf`, not ArduinoJson, since the shapes are fixed and the payloads are small):
+
+```jsonc
+// stat/<dev>/health
+{"heap": 234560, "rssi": -52, "uptime_ms": 873912, "err": 0}
+
+// stat/<dev>/state — chargers[] is pinOffset entries, lights[] is totalPins-pinOffset entries
+{"chargers": [0, 1], "lights": [1, 0]}
+
+// stat/<dev>/ack
+{"topic": "cmnd/GF-B1/charger/1", "ok": true, "t": 873912}
+```
+
+`statAck()` is overloaded:
+- `statAck(const char *originTopic, bool ok)` — direct topic string.
+- `statAck(char *segment[], size_t seg_len, bool ok)` — rebuilds the original topic by joining segments with `/` and forwards to the first form. This is what `cmnd()` and `conf()` actually call, since they only have access to the post-`strtok_r` segments.
+
+### `tele/tele.h`
+
+Header-only declaration with no `.cpp` implementation file yet. The sub-topic structure for `tele` will be defined when physical sensors are connected.
+
+> **Note on future sensor support:** When physical sensors are added to the device, their GPIO pin assignments will likely need to be added to the NVS provisioning system similarly to how `chargerPin` and `lightPin` are handled today. The `conf/<dev>/edit/...` namespace plus `getDeviceSpecificConfig()` will both need extending at that point.
 
 ---
 
@@ -817,42 +881,42 @@ This is an **earlier, simpler command handler** that predates the structured `cm
 
 ## 11. Architecture — How It All Fits Together
 
-The diagram below shows the three execution contexts inside the device (`setup()`, the Arduino `loop()` task, and the MQTT client FreeRTOS task), the external resources each one touches (NVS, WiFi, the broker), and which dispatch paths inside `MQTT_EVENT_DATA` are currently active vs. stubbed.
+Two diagrams: the **system topology** below shows the three execution contexts (`setup()`, the Arduino `loop()` task, and the MQTT client FreeRTOS task) plus the external resources they touch (NVS, WiFi, the broker). The **message dispatch flow** further down zooms into what happens to each incoming topic — which handler runs, what state it mutates, and what gets published back.
+
+### System topology
 
 ```mermaid
 flowchart TB
-    NVS[("NVS<br/>(flash)<br/>creds / pinDistribution / pinMapping")]
+    NVS[("NVS<br/>creds / pinDistribution / pinMapping")]
     WiFiNet(("2.4 GHz<br/>WiFi"))
-    Broker[("EMQX Broker<br/>emqx.internal.grdflo.com:8883<br/>TLS cert: GridFlow-RootCA<br/>per-device username + password")]
+    Broker[("EMQX broker<br/>emqx.internal.grdflo.com:8883<br/>TLS via GridFlow-RootCA<br/>per-device username + password")]
 
-    subgraph Device["ESP32-C3 / WROVER Device"]
+    subgraph Device["ESP32-C3 / WROVER"]
         direction TB
 
         subgraph SetupCtx["setup() — runs once on boot"]
             direction TB
-            cfg["getDeviceSpecificConfig()<br/>reads NVS, validates,<br/>heap-allocates chargerPin[pinOffset]<br/>and lightPin[totalPins-pinOffset]"]
-            wifi["initWiFiConnection()<br/>persistent(false) + setAutoReconnect(true)<br/>blocks until connected / reboot after 20 tries"]
-            mqtt["initMqtt()<br/>registers mqtt_event_handler<br/>starts MQTT client task (FreeRTOS)"]
-            cfg --> wifi --> mqtt
+            cfg["getDeviceSpecificConfig()<br/>read NVS + validate<br/>alloc chargerPin[pinOffset]<br/>alloc lightPin[totalPins − pinOffset]<br/>alloc relayState[totalPins] (zeroed)"]
+            wifi["initWiFiConnection()<br/>persistent(false), autoReconnect(true)<br/>block until WL_CONNECTED / reboot after 20 fails"]
+            mqttI["initMqtt()<br/>register mqtt_event_handler<br/>start MQTT FreeRTOS task"]
+            cfg --> wifi --> mqttI
         end
 
         subgraph LoopCtx["loop() — Arduino main task"]
             direction TB
-            wdt["esp_task_wdt_reset() every iteration"]
-            cycleWatch["if cycleFlag and<br/>millis() − cycleStart ≥ cycleInterval:<br/>• charger(cycleID, true)<br/>• cycleFlag = false"]
-            interval["every 60 s:<br/>• print free heap<br/>• reboot if globalErrorCounter ≥ 5<br/>• checkWiFiStatus()"]
-            wdt --> cycleWatch --> interval
+            wdt["esp_task_wdt_reset()"]
+            cycW["if cycleFlag and<br/>millis() − cycleStart ≥ cycleInterval:<br/>• charger(cycleID, true)<br/>• cycleFlag = false"]
+            tick["every 60 s:<br/>• print free heap<br/>• if globalErrorCounter ≥ 5: ESP.restart()<br/>• statHealth() → stat/&lt;u&gt;/health<br/>• checkWiFiStatus()"]
+            wdt --> cycW --> tick
         end
 
-        subgraph EvtCtx["mqtt_event_handler() — MQTT client FreeRTOS task"]
+        subgraph EvtCtx["mqtt_event_handler() — MQTT FreeRTOS task"]
             direction TB
-            connected["CONNECTED →<br/>• publish Online to testTopic<br/>• subscribe cmnd/&lt;username&gt;/#  QoS 2<br/>• globalErrorCounter = 0"]
-            disconnected["DISCONNECTED → log<br/>(client auto-reconnects)"]
-            data["DATA<br/>• tokenise topic on '/' into segment[]<br/>• guard tokenCount &lt; 4<br/>• verify segment[1] == username<br/>• dispatch by segment[0]:<br/>&nbsp;&nbsp;• cmnd → <b>cmnd()</b> &nbsp;[active — charger / light / cycle]<br/>&nbsp;&nbsp;• stat → stat() &nbsp;[stub, commented]<br/>&nbsp;&nbsp;• tele → tele() &nbsp;[stub, commented]<br/>&nbsp;&nbsp;• conf → not wired"]
-            errored["ERROR → globalErrorCounter++"]
-            legacy["[DEPRECATED]<br/>cmd(payload) — block-commented, no longer reached"]
-            connected --- disconnected --- data --- errored
-            data -. "deprecated path" .-> legacy
+            conn["CONNECTED:<br/>• publish 'Online' → testTopic<br/>• subscribe cmnd/&lt;user&gt;/# QoS 2<br/>• subscribe conf/&lt;user&gt;/# QoS 2<br/>• globalErrorCounter = 0"]
+            disc["DISCONNECTED:<br/>• log (client auto-reconnects)"]
+            data["DATA:<br/>• tokenise on '/'<br/>• guard tokenCount &lt; 3<br/>• verify segment[1] == username<br/>• dispatch on segment[0]<br/>• (details ⇩ message flow)"]
+            err["ERROR:<br/>• globalErrorCounter++"]
+            conn --- disc --- data --- err
         end
 
         SetupCtx --> LoopCtx
@@ -861,9 +925,99 @@ flowchart TB
 
     NVS -. read at boot .-> cfg
     WiFiNet === wifi
-    mqtt == "TLS / MQTT&nbsp;:8883" ==> Broker
-    Broker == "messages" ==> data
+    mqttI ==>|"TLS / MQTT :8883"| Broker
+    Broker ==>|"cmnd/&lt;u&gt;/# and conf/&lt;u&gt;/#"| data
+    EvtCtx ==>|"stat/&lt;u&gt;/health (retained)<br/>stat/&lt;u&gt;/state (retained)<br/>stat/&lt;u&gt;/ack"| Broker
 ```
+
+### Message dispatch flow
+
+This diagram traces every supported topic from arrival through dispatch into the per-handler functions, the device state they touch, and the outbound publish each one produces.
+
+```mermaid
+flowchart LR
+    subgraph In["incoming topics (cloud → device)"]
+        direction TB
+        T1["cmnd/&lt;u&gt;/charger/&lt;i&gt;<br/>payload: '0' | '1'"]
+        T2["cmnd/&lt;u&gt;/light/&lt;i&gt;<br/>payload: '0' | '1'"]
+        T3["cmnd/&lt;u&gt;/charger/&lt;i&gt;/cycle<br/>payload: seconds"]
+        T4["conf/&lt;u&gt;/health"]
+        T5["conf/&lt;u&gt;/state"]
+        T6["conf/&lt;u&gt;/reboot"]
+        T7["conf/&lt;u&gt;/edit/&lt;ns&gt;/&lt;key&gt;<br/>payload: new value"]
+    end
+
+    Disp{{"MQTT_EVENT_DATA<br/>tokenise + dispatch<br/>(guard tokenCount &lt; 3,<br/>segment[1] == username)"}}
+
+    subgraph CmndH["cmnd() &nbsp;[guard seg_len &lt; 4]"]
+        direction TB
+        cmCharger["charger(id, state)<br/>digitalWrite chargerPin[id]<br/>relayState[id] = 0|1<br/>return 0 | −1"]
+        cmLight["light(id, state)<br/>digitalWrite lightPin[id]<br/>relayState[pinOffset + id] = 0|1<br/>return 0 | −1"]
+        cmCycle["cycle(sec, segment)<br/>charger(id, false)<br/>arm cycleFlag / cycleStart /<br/>cycleInterval / cycleID<br/>return 0 | −1"]
+        cmExit["statAck(segment, seg_len, status == 0)"]
+        cmCharger --> cmExit
+        cmLight --> cmExit
+        cmCycle --> cmExit
+    end
+
+    subgraph ConfH["conf() &nbsp;[guard seg_len &lt; 3]"]
+        direction TB
+        cnHealth["statHealth()"]
+        cnState["statState()"]
+        cnReboot["ESP.restart()"]
+        cnEdit["edit/&lt;ns&gt;/&lt;key&gt;<br/>(seg_len ≥ 5)<br/>Preferences::putString<br/>if isKey() · then<br/>statAck(segment, seg_len, ok)"]
+    end
+
+    subgraph LoopWatch["loop() — timers"]
+        direction TB
+        cwFire["cycle re-enable:<br/>when millis() − cycleStart ≥ cycleInterval:<br/>charger(cycleID, true)<br/>cycleFlag = false"]
+        cwTick["60 s heartbeat:<br/>statHealth()"]
+    end
+
+    subgraph State["device state"]
+        direction TB
+        relS["relayState[totalPins]<br/>(mirror of GPIO levels)"]
+        cycS["cycleFlag / cycleID /<br/>cycleStart / cycleInterval"]
+    end
+
+    subgraph Out["outbound publishes (device → cloud, stat/)"]
+        direction TB
+        Phealth["stat/&lt;u&gt;/health<br/>QoS 2, retain=1<br/>{heap, rssi, uptime_ms, err}"]
+        Pstate["stat/&lt;u&gt;/state<br/>QoS 2, retain=1<br/>{chargers[], lights[]}"]
+        Pack["stat/&lt;u&gt;/ack<br/>QoS 2, retain=0<br/>{topic, ok, t}"]
+    end
+
+    T1 --> Disp
+    T2 --> Disp
+    T3 --> Disp
+    T4 --> Disp
+    T5 --> Disp
+    T6 --> Disp
+    T7 --> Disp
+
+    Disp -->|"segment[0] == cmnd"| CmndH
+    Disp -->|"segment[0] == conf"| ConfH
+
+    cmCharger -. writes .-> relS
+    cmLight -. writes .-> relS
+    cmCycle -. arms .-> cycS
+    cwFire -. reads/clears .-> cycS
+    cwFire -. writes .-> relS
+    Pstate -. reads .-> relS
+
+    cmExit --> Pack
+    cnHealth --> Phealth
+    cnState --> Pstate
+    cnEdit --> Pack
+    cwTick --> Phealth
+```
+
+A few invariants this picture encodes:
+
+- Every successful path through `cmnd()` ends in a single `statAck()` — there's only one ack per inbound `cmnd` message, regardless of which sub-function (charger/light/cycle) ran.
+- The cycle re-enable is owned by `loop()`, **not** by `cycle()` — that's why the cycle-watcher is in its own subgraph and reads/clears the cycle bookkeeping that `cycle()` armed.
+- `relayState[]` has three writers (`charger()`, `light()`, and the cycle-watcher in `loop()` via `charger()`) but only one reader on the publish side (`statState()`). It's the single source of truth for "what relays are currently on".
+- `stat/...` topics are **publish only** for the device — there is no subscription on `stat/<u>/#`, so the device never sees its own retained state.
 
 ---
 
@@ -956,15 +1110,33 @@ cmnd/<device_id>/charger/<channelID>/cycle            # timed off-then-on
 
 Payload semantics: numeric only. `atoi()` is used for parsing, so `"ON"`/`"OFF"` parse as 0 and turn the relay OFF — use `"1"`/`"0"` for on/off, and a positive integer for `cycle`.
 
-### `stat`, `tele`, `conf` topic structure (not yet designed)
+### `conf` topic structure
 
-Sub-topic levels for these three namespaces will be defined when the handlers are implemented.
+```
+conf/<device_id>/health                                # request → device publishes stat/<id>/health
+conf/<device_id>/state                                 # request → device publishes stat/<id>/state
+conf/<device_id>/reboot                                # ESP.restart()
+conf/<device_id>/edit/<namespace>/<key>     payload=<value>   # NVS write, then ack
+```
 
-| Topic (placeholder) | Direction | Meaning |
-|---------------------|-----------|---------|
-| `stat/GF-B1/...` | Device → Cloud | Device health — free heap, WiFi RSSI, uptime |
-| `tele/GF-B1/...` | Device → Cloud | Sensor telemetry (sensors not yet connected) |
-| `conf/GF-B1/...` | Cloud → Device | Runtime configuration update |
+| Topic | Payload | Direction | Meaning |
+|-------|---------|-----------|---------|
+| `conf/GF-B1/health` | (ignored) | Cloud → Device | Trigger an out-of-cycle health snapshot publish |
+| `conf/GF-B1/state` | (ignored) | Cloud → Device | Trigger an out-of-cycle relay-state snapshot publish |
+| `conf/GF-B1/reboot` | (ignored) | Cloud → Device | Soft reboot via `ESP.restart()` |
+| `conf/GF-B1/edit/creds/wifi_pass` | `"<new password>"` | Cloud → Device | Write new value to NVS `creds` namespace, key `wifi_pass`; takes effect on next reboot |
+
+### `stat` topic structure (device → cloud)
+
+| Topic | QoS | Retain | Body | Trigger |
+|-------|-----|--------|------|---------|
+| `stat/GF-B1/health` | 2 | yes | `{"heap":<n>,"rssi":<dBm>,"uptime_ms":<n>,"err":<n>}` | `conf/<dev>/health` request (planned: also 60 s loop tick) |
+| `stat/GF-B1/state` | 2 | yes | `{"chargers":[0|1,...],"lights":[0|1,...]}` | `conf/<dev>/state` request |
+| `stat/GF-B1/ack` | 2 | no | `{"topic":"<original topic>","ok":true|false,"t":<ms>}` | Every `cmnd` and every `conf/edit` |
+
+### `tele` topic structure (not yet designed)
+
+`tele/GF-B1/...` will carry physical sensor telemetry once sensors are wired up.
 
 ---
 
@@ -972,22 +1144,22 @@ Sub-topic levels for these three namespaces will be defined when the handlers ar
 
 | Component | File | Status | Notes |
 |-----------|------|--------|-------|
-| `stat` handler | `src/functions/stat/` | Header only | No `.cpp` file; topic structure not yet designed; dispatch line in `mqttManager.cpp:63` is commented out, waiting for the handler |
-| `tele` handler | `src/functions/tele/` | Header only | No `.cpp` file; sensors not yet connected; dispatch line at `mqttManager.cpp:64` is commented out |
-| `conf` handler | `src/functions/conf/conf.cpp` | Empty stub | Function signature exists, body is empty |
-| `conf` wiring into router | `mqttManager.cpp` | Not added | `conf.h` not yet `#include`d in `mqttManager.cpp` and no `conf()` dispatch line — not even commented |
+| `tele` handler | `src/functions/tele/` | Header only | No `.cpp` file; sensors not yet connected; no dispatch line in `mqttManager.cpp` and no subscription |
+| Auto `statState()` on every relay change | `cmnd.cpp` `charger()` / `light()` | Not wired | Currently only published on `conf/<dev>/state` request. Calling `statState()` after each mutation would let dashboards stay in sync without polling |
 | Per-channel cycle bookkeeping | `cmnd.cpp:7–10` | Single-slot only | `cycleFlag`/`cycleID`/`cycleStart`/`cycleInterval` are scalars — a second cycle command overwrites any in-flight cycle. Needs to become per-channel arrays if concurrent cycles are required |
 | Cycle payload validation | `cmnd.cpp:18` | Loose | `seg_len >= 5` permits a cycle topic with no payload-seconds; `atoi()` parse falls through to 0 → instant flicker. Tighten to `seg_len >= 5 && atoi(payload) > 0` or use JSON when payload schema firms up |
-| Last Will (LWT) | `mqttManager.cpp:96–101` | Commented out | Pending final `stat/` topic structure |
+| `conf/edit` namespace support | `conf.cpp` | Only `creds` wired | Only the `creds` namespace is writable today. `pinDistribution` and `pinMapping` writes need to be added (with revalidation of `offset <= totalPin` etc.) before runtime pin reconfig is possible |
+| `conf/reboot` ack | `conf.cpp:27–30` | Intentional | `ESP.restart()` cannot ack — the cloud-side signal that the reboot worked is the next `MQTT_EVENT_CONNECTED` and the "Online" publish |
+| Last Will (LWT) | `mqttManager.cpp:96–101` | Commented out | Pending final `stat/` topic structure — natural target is `stat/<dev>/online` with body `{"online":false}` |
 | `MQTT_EVENT_ERROR` detail | `mqttManager.cpp:77–80` | Minimal | Prints event name and increments `globalErrorCounter` — actual reason from `error_handle` not extracted |
 | MQTT init null check | `mqttManager.cpp:103` | Missing | `esp_mqtt_client_init()` return value not checked for NULL |
 | VLA stack allocation | `mqttManager.cpp:39, 57` | Present | `topic` and `payload` are variable-length stack arrays — valid as a GCC extension but fragile under large MQTT payloads. Fixed-size buffers with explicit size checks would be safer |
 | WDT reset in WiFi loop | `initWiFiConnection.cpp:9` | Missing | The blocking connect loop does not call `esp_task_wdt_reset()` — safe now (10 s < 30 s WDT), but fragile if the timeout or attempt count is ever increased |
-| `stat/` runtime topic | `mqttManager.cpp:20` | Placeholder | Boot "Online" announce still publishes to the dev `testTopic` (`"test"`) — must move to a `stat/<username>/online` topic once the `stat` namespace is designed |
-| Telemetry publishing | — | Not started | Nothing published to `stat/` or `tele/` yet; planned for the 60-second `loop()` interval |
+| `stat/<dev>/online` boot announce | `mqttManager.cpp:20` | Placeholder | Boot "Online" still publishes to the dev `testTopic` (`"test"`) — should move to `stat/<username>/online` to match the rest of the `stat/` namespace and pair with the future LWT |
 | Sensor support | — | Not started | `tele` is reserved for physical sensor data; pin mapping will need extending when sensors are added |
 | OTA firmware update | — | Not started | Updates currently require physical USB access; ESP32 OTA support via `cmnd` is the planned approach |
 | NVS encryption | — | Not started | Credentials currently stored in plaintext flash; ESP32 NVS encryption via eFuse-backed key is the production solution |
+| Broker ACL hardening on `conf/edit` | broker side | Operational | `conf/<dev>/edit/creds/...` can rewrite WiFi/MQTT credentials — needs a much tighter ACL than `cmnd/<dev>/#` |
 
 ---
 

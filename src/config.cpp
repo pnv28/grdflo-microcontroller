@@ -37,6 +37,7 @@ String password;
 u8_t pinOffset;
 u8_t totalPins;
 int *chargerPin, *lightPin;
+int *relayState;
 
 
 void getDeviceSpecificConfig() {
@@ -66,6 +67,7 @@ void getDeviceSpecificConfig() {
 
     chargerPin = new int[pinOffset];
     lightPin = new int[totalPins - pinOffset];
+    relayState = new int[totalPins]();   // value-initialised → all zero at boot
 
     int counter;
     int i = 0;

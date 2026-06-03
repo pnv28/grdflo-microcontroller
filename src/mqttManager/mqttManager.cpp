@@ -8,6 +8,7 @@
 #include "functions/cmnd/cmnd.h"
 #include "functions/stat/stat.h"
 #include "functions/tele/tele.h"
+#include "functions/conf/conf.h"
 
 esp_mqtt_client_handle_t client;
 
@@ -20,6 +21,8 @@ static void mqtt_event_handler(void* handler_args, esp_event_base_t base, int32_
       esp_mqtt_client_enqueue(client, testTopic, "GF-KD1-Test --> Online", 0, 0, 0, true);
       String cmndTopic = "cmnd/" + username + "/#";
       esp_mqtt_client_subscribe(client, cmndTopic.c_str(), 2);
+      String confTopic = "conf/" + username + "/#";
+      esp_mqtt_client_subscribe(client, confTopic.c_str(), 2);
       globalErrorCounter = 0;
       }
       break;
@@ -52,7 +55,7 @@ static void mqtt_event_handler(void* handler_args, esp_event_base_t base, int32_
         token = strtok_r(NULL, "/", &savePtr);
       }
 
-      if (tokenCount < 4) return; 
+      if (tokenCount < 3) return; 
 
       char payload[event->data_len + 1];
       memcpy(payload, event->data, event->data_len);
@@ -60,8 +63,8 @@ static void mqtt_event_handler(void* handler_args, esp_event_base_t base, int32_
 
       if(strcmp(segment[1], username.c_str()) == 0) {
         if(strcmp(segment[0], "cmnd") == 0) cmnd(segment, tokenCount, payload);
-        // if(strcmp(segment[0], "stat") == 0) stat(segment, tokenCount, payload);
-        // if(strcmp(segment[0], "tele") == 0) tele(segment, tokenCount, payload);
+        if(strcmp(segment[0], "conf") == 0) conf(segment, tokenCount, payload);
+        // stat/ and tele/ are publish-only namespaces — device → cloud only
       } else {
         Serial.println("Client ID Mismatch");
       }

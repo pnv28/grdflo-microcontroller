@@ -28,6 +28,7 @@ extern u8_t pinOffset;
 extern u8_t totalPins;
 extern int *chargerPin;
 extern int *lightPin;
+extern int *relayState;
 
 extern unsigned long cycleInterval;
 extern unsigned long cycleStart;

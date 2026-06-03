@@ -7,6 +7,7 @@
 #include "wifiUtils.h"
 #include "mqttManager/mqttManager.h"
 #include "functions/cmnd/cmnd.h"
+#include "functions/stat/stat.h"
 
 esp_task_wdt_config_t wdt_cfg = {
   .timeout_ms     = 30000,
@@ -54,7 +55,7 @@ void loop() {
     if(globalErrorCounter >= 5) {
       ESP.restart();
     }
-
+    statHealth();
     checkWiFiStatus(ssid.c_str(), wifiPassword.c_str()); 
   }
 }

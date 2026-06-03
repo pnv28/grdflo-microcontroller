@@ -3,6 +3,9 @@
 
 #include "config.h"
 
-void stat(char *segment[], const size_t seg_len, const char *payload);
+void statHealth();
+void statAck(const char *originTopic, bool ok);
+void statAck(char *segment[], size_t seg_len, bool ok);
+void statState();
 
 #endif
