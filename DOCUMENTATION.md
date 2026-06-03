@@ -1,6 +1,6 @@
 # GridFlow Microcontroller Firmware — Documentation
 
-> **Status: Functional, with `tele` and a few hardening items outstanding.** The WiFi + TLS-MQTT infrastructure is live, the structured `MQTT_EVENT_DATA` router is active, and the `cmnd`, `conf`, and `stat` namespaces are all wired in. `cmnd` covers `charger`, `light`, and `cycle`; `conf` covers `health`, `state`, `reboot`, and `edit` (currently only the `creds` NVS namespace is writable); `stat` is publish-only and exposes `statHealth()` / `statState()` / `statAck()`. Periodic `statHealth()` runs from the 60 s `loop()` heartbeat; every actioned `cmnd` and every `conf/edit` publishes a `stat/<dev>/ack`. Outstanding: `tele` is still a header-only stub (no sensors connected), automatic `statState()` on relay change is not wired, and several smaller items are listed in [Section 14](#14-what-is-not-yet-implemented).
+> **Status: Functional, with `tele` and a few hardening items outstanding.** The WiFi + TLS-MQTT infrastructure is live, the structured `MQTT_EVENT_DATA` router is active, and the `cmnd`, `conf`, and `stat` namespaces are all wired in. `cmnd` covers `charger`, `light`, and `cycle`; `conf` covers `health`, `state`, `reboot`, and `edit` (currently only the `creds` NVS namespace is writable); `stat` is publish-only and exposes `statHealth()` / `statState()` / `statAck()`. Periodic `statHealth()` runs from the 60 s `loop()` heartbeat; every actioned `cmnd` and every `conf/edit` publishes a `stat/<dev>/ack`. Outstanding: `tele` is still a header-only stub (no sensors connected), automatic `statState()` on relay change is not wired, and several smaller items are listed in [Section 15](#15-what-is-not-yet-implemented).
 >
 > **Current dev-time behaviour:** Inside `MQTT_EVENT_DATA` the topic is tokenised on `/` into `segment[]` (guard `tokenCount < 3`), the device-ID is verified against `username`, and dispatch runs on `segment[0]` — `cmnd → cmnd()` and `conf → conf()`. The broker subscriptions established in `MQTT_EVENT_CONNECTED` are `cmnd/<username>/#` and `conf/<username>/#`, both at QoS 2. The legacy `cmd(payload)` debug handler in `src/cmd.cpp` is no longer reached — the call site inside `MQTT_EVENT_DATA` is wrapped in a `/* … */` block and retained only as a marker that the path was deliberately retired.
 
@@ -17,11 +17,12 @@
 7. [WiFi Utilities — `lib/wifiUtils/`](#7-wifi-utilities--libwifiutils)
 8. [MQTT Manager — `src/mqttManager/`](#8-mqtt-manager--srcmqttmanager)
 9. [Topic Routing — `src/functions/`](#9-topic-routing--srcfunctions)
-10. [Debug Command Handler — `src/cmd.cpp`](#10-debug-command-handler--srccmdcpp)
-11. [Architecture — How It All Fits Together](#11-architecture--how-it-all-fits-together)
-12. [NVS Provisioning](#12-nvs-provisioning)
-13. [MQTT Topic Structure](#13-mqtt-topic-structure)
-14. [What Is Not Yet Implemented](#14-what-is-not-yet-implemented)
+10. [Status LED — `src/statusManager/`](#10-status-led--srcstatusmanager)
+11. [Debug Command Handler — `src/cmd.cpp`](#11-debug-command-handler--srccmdcpp)
+12. [Architecture — How It All Fits Together](#12-architecture--how-it-all-fits-together)
+13. [NVS Provisioning](#13-nvs-provisioning)
+14. [MQTT Topic Structure](#14-mqtt-topic-structure)
+15. [What Is Not Yet Implemented](#15-what-is-not-yet-implemented)
 
 ---
 
@@ -52,15 +53,15 @@ Each board has its own PlatformIO environment in `platformio.ini`. Switch betwee
 
 ### GPIO Pin Assignments
 
-| Constant    | GPIO | Purpose                                   |
-|-------------|------|-------------------------------------------|
-| `LED_PIN`   | 10   | Addressable RGB LED (WS2812-type)         |
-| `RED_PIN`   | 21   | External red indicator LED / output (currently parked on bricked pin) |
-| `BLUE_PIN`  | 21   | External blue indicator LED / output (currently parked on bricked pin) |
+| Constant    | Where defined | GPIO | Purpose                                   |
+|-------------|---------------|------|-------------------------------------------|
+| `LED_PIN`   | `src/statusManager/statusManager.h` | 10 | Onboard addressable RGB LED (WS2812) — drives the operational status indicator |
+| `RED_PIN`   | `src/config.h` | 21 | External red indicator LED / output (currently parked on bricked pin) |
+| `BLUE_PIN`  | `src/config.h` | 21 | External blue indicator LED / output (currently parked on bricked pin) |
 
-All three constants are defined in `config.h`. These are fixed indicator and debug pins — not relay channels.
+These are fixed indicator pins — not relay channels. `LED_PIN` lives in `statusManager.h` because that is the only module that drives it; `RED_PIN` / `BLUE_PIN` stay in `config.h` because legacy debug paths still reference them.
 
-> **GRB quirk (ESP32-C3 only):** The onboard RGB LED on the ESP32-C3-DevKitM-1 uses **GRB** byte order instead of the usual RGB. The `rgbLedWrite()` calls in `cmd.cpp` account for this — the second argument is Green, third is Red, fourth is Blue. The WROVER has no LED connected, so `LED_PIN` and all LED-related code in `cmd.cpp` have no effect on that board for now.
+> **GRB quirk (ESP32-C3 only):** The onboard RGB LED on the ESP32-C3-DevKitM-1 uses **GRB** byte order instead of the usual RGB. The `rgbLedWrite()` calls in `statusManager.cpp` (and the legacy `cmd.cpp`) account for this — the second argument is Green, third is Red, fourth is Blue. So `rgbLedWrite(LED_PIN, 0, 255, 0)` produces **red**, not green. The WROVER has no LED on this pin, so all the `rgbLedWrite()` calls are harmless no-ops on that board. See [Section 10](#10-status-led--srcstatusmanager) for the full status palette.
 
 > **Hardware note from pnv:** GPIO 21 on the original dev board is damaged. `RED_PIN` and `BLUE_PIN` are deliberately both pointed at 21 (`#define BLUE_PIN 21 // i know it is bricked`) so the legacy `cmd.cpp` debug commands cannot accidentally drive a working relay channel while the indicator-pin design is in flux.
 
@@ -86,8 +87,17 @@ grdflo-microcontroller/
 │   ├── main.cpp                    # setup() and loop() — firmware entry point
 │   ├── config.h                    # Global constants, pin defs, extern declarations
 │   ├── config.cpp                  # Global variable definitions + NVS credential/pin loading
-│   ├── cmd.h                       # Declaration for the debug cmd() function
-│   ├── cmd.cpp                     # Debug command handler (LED/pin control via MQTT payload)
+│   ├── cmd.h                       # Declaration for the legacy debug cmd() function
+│   ├── cmd.cpp                     # Legacy debug command handler (no longer reached at runtime)
+│   │
+│   ├── statusManager/
+│   │   ├── statusManager.h         # Status state codes + LED_PIN definition + statusHandler() decl
+│   │   └── statusManager.cpp       # rgbLedWrite() driver for the onboard WS2812 status LED
+│   │
+│   ├── wifiUtils/                  # WiFi connect + runtime health check (calls statusHandler)
+│   │   ├── wifiUtils.h
+│   │   ├── initWiFiConnection.cpp  # Blocking WiFi connect with reboot-on-failure
+│   │   └── checkWiFiStatus.cpp     # Periodic WiFi health check + reconnect
 │   │
 │   ├── mqttManager/
 │   │   ├── mqttManager.h           # Public API: initMqtt(), mqttPublish()
@@ -106,13 +116,7 @@ grdflo-microcontroller/
 │           ├── conf.h              # Declaration for conf() handler
 │           └── conf.cpp            # health/state/reboot read commands + edit (NVS write) + ack
 │
-├── lib/                            # Project-private libraries (compiled separately by PlatformIO)
-│   └── wifiUtils/
-│       └── src/
-│           ├── wifiUtils.h         # Declarations for WiFi helpers
-│           ├── initWiFiConnection.cpp  # Blocking WiFi connect with reboot-on-failure
-│           └── checkWiFiStatus.cpp     # Periodic WiFi health check + reconnect
-│
+├── lib/                            # (Empty — previously held wifiUtils; moved to src/ so statusManager is reachable)
 ├── include/                        # (Empty — reserved for shared project headers)
 └── test/                           # (Empty — reserved for unit tests)
 ```
@@ -181,12 +185,13 @@ These two files together define all the **global state** of the device.
 ```cpp
 #define RED_PIN      21
 #define BLUE_PIN     21    // i know it is bricked
-#define LED_PIN      10
 #define MAX_SEGMENT   6
 ```
 
-- `RED_PIN` / `BLUE_PIN` / `LED_PIN`: GPIO numbers for the indicator pins. Both indicator constants currently point at the bricked GPIO 21 — see [Section 2](#2-hardware) for the reason.
+- `RED_PIN` / `BLUE_PIN`: GPIO numbers for the legacy external indicator pins. Both currently point at the bricked GPIO 21 — see [Section 2](#2-hardware) for the reason.
 - `MAX_SEGMENT`: The maximum number of `/`-separated segments the firmware will parse from an incoming MQTT topic string. A topic like `cmnd/GF-B1/charger/0/cycle` has 5 segments; the upper bound of 6 accommodates the longest currently-routed form (`cmnd/<dev>/charger/<id>/cycle`).
+
+(`LED_PIN` lives in `src/statusManager/statusManager.h` rather than here — it is only used by the status-LED driver, so keeping it inside that module reduces the public surface of `config.h`.)
 
 The header also `extern`-declares every global variable that other `.cpp` files need to access:
 
@@ -247,7 +252,7 @@ const char* brokerUri = "mqtts://emqx.internal.grdflo.com:8883";
 const char* testTopic = "test";
 ```
 
-Development placeholder used as the topic for the "Online" announce in `MQTT_EVENT_CONNECTED`. The real per-device control topic (see [Section 13](#13-mqtt-topic-structure)) is **already** built at runtime from `username` and subscribed to as `cmnd/<username>/#` — `testTopic` only remains for the boot-time online ping and will be removed once the `stat/` namespace is finalised.
+Development placeholder used as the topic for the "Online" announce in `MQTT_EVENT_CONNECTED`. The real per-device control topic (see [Section 14](#14-mqtt-topic-structure)) is **already** built at runtime from `username` and subscribed to as `cmnd/<username>/#` — `testTopic` only remains for the boot-time online ping and will be removed once the `stat/` namespace is finalised.
 
 #### `globalErrorCounter`
 
@@ -399,7 +404,7 @@ If any key returns the sentinel `255` (meaning the key doesn't exist), the devic
 
 **Why NVS for all of this?** Hardcoding credentials and pin assignments in the firmware binary is a security and flexibility problem. The binary can be extracted from flash and read. Different hardware variants would require maintaining separate firmware builds. By storing everything in NVS (which supports per-device encryption via ESP32's eFuse-backed NVS encryption), every device has unique credentials and wiring without a firmware rebuild.
 
-> The `nvs.csv` and `nvs.bin` files used to flash these values are intentionally **gitignored** (they contain real credentials and device-specific hardware config). See [Section 12](#12-nvs-provisioning).
+> The `nvs.csv` and `nvs.bin` files used to flash these values are intentionally **gitignored** (they contain real credentials and device-specific hardware config). See [Section 13](#13-nvs-provisioning).
 
 ---
 
@@ -425,13 +430,14 @@ The **Task Watchdog Timer (TWDT)** is the firmware's self-recovery mechanism. If
 
 Runs once on power-on / reset. Execution order matters here:
 
-1. **`Serial.begin(115200)`** — Start serial output for debugging.
-2. **`pinMode(RED_PIN/BLUE_PIN, OUTPUT)`** — Configure the two indicator GPIO pins as digital outputs.
-3. **`esp_task_wdt_reconfigure() + esp_task_wdt_add(NULL)`** — Arm the watchdog before any network calls that could potentially hang.
-4. **`getDeviceSpecificConfig()`** — Load all credentials and pin mapping from NVS. Reboots on any failure.
-5. **`delay(3000)`** — A 3-second pause letting hardware, the radio subsystem, and internal peripherals stabilise before making network calls.
-6. **`initWiFiConnection(ssid, wifiPassword)`** — Connect to WiFi. Blocks until connected or reboots after 20 failed attempts.
-7. **`initMqtt()`** — Start the MQTT client. After this, the device is fully online and the MQTT event handler drives all further behaviour.
+1. **`statusHandler(STATE_BOOT)`** — First line. Sets the onboard status LED to dim white so the operator can see the device is alive even before Serial is up. See [Section 10](#10-status-led--srcstatusmanager) for the full palette.
+2. **`Serial.begin(115200)`** — Start serial output for debugging.
+3. **`pinMode(RED_PIN/BLUE_PIN, OUTPUT)`** — Configure the two legacy indicator GPIO pins as digital outputs.
+4. **`esp_task_wdt_reconfigure() + esp_task_wdt_add(NULL)`** — Arm the watchdog before any network calls that could potentially hang.
+5. **`getDeviceSpecificConfig()`** — Load all credentials and pin mapping from NVS. Reboots (with `STATE_ERROR` = solid red LED) on any failure.
+6. **`delay(3000)`** — A 3-second pause letting hardware, the radio subsystem, and internal peripherals stabilise before making network calls.
+7. **`initWiFiConnection(ssid, wifiPassword)`** — Sets the LED to `STATE_WIFI_CONNECTING` (yellow) internally, then connects. Blocks until connected or reboots after 20 failed attempts (with LED on `STATE_ERROR`).
+8. **`initMqtt()`** — Start the MQTT client. Returns immediately; the LED stays yellow until `MQTT_EVENT_CONNECTED` fires in the background and flips it to `STATE_ALL_IS_WELL` (dim green).
 
 ### `loop()`
 
@@ -473,15 +479,16 @@ The `millis()` / timestamp pattern is a **non-blocking interval timer** — it a
 
 ---
 
-## 7. WiFi Utilities — `lib/wifiUtils/`
+## 7. WiFi Utilities — `src/wifiUtils/`
 
-This is a **project-private library** placed under `lib/` so PlatformIO compiles it as a separate static library. It provides two functions.
+Connection helpers used at startup and periodically thereafter. Previously lived under `lib/wifiUtils/` as a PlatformIO static library, but was moved into `src/` so it can `#include "statusManager/statusManager.h"` and update the status LED on connect / drop. (A library under `lib/` would need explicit `lib_deps` plumbing to see headers in `src/`.) It provides two functions.
 
 ### `initWiFiConnection(ssid, password)` — `initWiFiConnection.cpp`
 
-Blocking WiFi connection used at startup.
+Blocking WiFi connection used at startup. Entry sets the LED to `STATE_WIFI_CONNECTING` (yellow) so the operator can see "we're trying" during the up-to-10-second wait. On failure the LED is set to `STATE_ERROR` (solid red) just before the reboot, so an operator watching a bricked board sees red-flash → reboot → red-flash in a loop, which is the on-site signal for "WiFi credentials are wrong / AP is gone".
 
 ```cpp
+statusHandler(STATE_WIFI_CONNECTING);
 WiFi.setAutoReconnect(true);   // ← must be before WiFi.begin()
 WiFi.persistent(false);        // ← must be before WiFi.begin()
 WiFi.begin(ssid, password);
@@ -503,6 +510,7 @@ Called from `loop()` every 60 seconds as an **application-level WiFi watchdog**.
 ```cpp
 void checkWiFiStatus(const char *ssid, const char *password) {
     if (WiFi.status() != WL_CONNECTED) {
+        statusHandler(STATE_WIFI_CONNECTING);
         Serial.println("WiFi lost, reconnecting...");
         WiFi.disconnect();
         WiFi.begin(ssid, password);
@@ -510,7 +518,9 @@ void checkWiFiStatus(const char *ssid, const char *password) {
 }
 ```
 
-This is a safety net on top of `setAutoReconnect(true)`. If the driver-level reconnect fails or gets stuck in a bad state, this manually forces a fresh `WiFi.begin()`. The `Serial.println` before the reconnect attempt makes WiFi loss events clearly visible in the monitor log — without it, a silent reconnect would make it hard to correlate MQTT disconnections with WiFi drops.
+This is a safety net on top of `setAutoReconnect(true)`. If the driver-level reconnect fails or gets stuck in a bad state, this manually forces a fresh `WiFi.begin()`. The status LED flips back to yellow so an operator can see the device is in a reconnect attempt, not in a steady-state failure. The `Serial.println` before the reconnect attempt makes WiFi loss events clearly visible in the monitor log too.
+
+There is intentionally **no** "WiFi-came-back" branch here that resets the LED to green. Once WiFi reconnects, the MQTT client notices its keepalive failing and re-handshakes; the `MQTT_EVENT_CONNECTED` callback is what flips the LED back to dim green. This keeps the LED honest: yellow stays on while the *full network stack* is still rebuilding, not just the radio.
 
 ---
 
@@ -593,14 +603,14 @@ globalErrorCounter = 0;
 When the client successfully connects to the broker:
 1. Prints a confirmation to serial.
 2. Publishes a retained "Online" announcement to the dev `testTopic` ("test").
-3. Builds the per-device wildcard subscription `cmnd/<username>/#` at runtime and subscribes at QoS 2 (exactly-once delivery). This catches every `cmnd/<this-device>/...` topic the broker routes to it, including the future `cycle` subtopics.
-4. Resets `globalErrorCounter` to 0 — a successful (re)connect clears the error budget that drives the auto-reboot in `loop()`.
-
-A separate `conf/` subscription is still TODO — `conf.h` is not yet wired into the dispatcher.
+3. Builds the per-device wildcard subscription `cmnd/<username>/#` at runtime and subscribes at QoS 2 (exactly-once delivery). This catches every `cmnd/<this-device>/...` topic the broker routes to it, including the `cycle` subtopics.
+4. Subscribes to `conf/<username>/#` at QoS 2 (health/state/reboot/edit requests).
+5. Resets `globalErrorCounter` to 0 — a successful (re)connect clears the error budget that drives the auto-reboot in `loop()`.
+6. Calls `statusHandler(STATE_ALL_IS_WELL)` to flip the onboard status LED to dim green — the "everything is healthy" signal.
 
 **`MQTT_EVENT_DISCONNECTED`**
 
-Prints `"Disconnected from broker (auto-reconnecting...)"`. The ESP-IDF MQTT client handles reconnection automatically — no manual reconnect code needed here.
+Prints `"Disconnected from broker (auto-reconnecting...)"` and calls `statusHandler(STATE_MQTT_DISCONNECTED)` to flip the LED to cyan. The ESP-IDF MQTT client handles reconnection automatically — no manual reconnect code needed here. When the client eventually re-handshakes, `MQTT_EVENT_CONNECTED` fires and the LED returns to dim green.
 
 **`MQTT_EVENT_SUBSCRIBED`**
 
@@ -668,12 +678,13 @@ Only the `cmnd` dispatch is currently live. `stat`/`tele` are present as comment
 
 ```cpp
 case MQTT_EVENT_ERROR:
+    statusHandler(STATE_ERROR);
     Serial.println("MQTT_EVENT_ERROR");
     globalErrorCounter++;
     break;
 ```
 
-Prints `"MQTT_EVENT_ERROR"` and bumps `globalErrorCounter`. The actual error reason (TLS failure, connection refused, socket error) is available in `event->error_handle` but is not yet extracted and logged. The error-counter feeds the 60-second auto-reboot check in `loop()` — see [Section 6](#6-entry-point--maincpp).
+Flips the status LED to solid red, prints `"MQTT_EVENT_ERROR"`, and bumps `globalErrorCounter`. The actual error reason (TLS failure, connection refused, socket error) is available in `event->error_handle` but is not yet extracted and logged. The error-counter feeds the 60-second auto-reboot check in `loop()` — see [Section 6](#6-entry-point--maincpp). The LED stays red until either a successful reconnect (`MQTT_EVENT_CONNECTED` → green) or until the error-counter reboot fires (back to white via `STATE_BOOT`).
 
 **`default`**
 
@@ -814,7 +825,7 @@ Example: `conf/GF-B1/edit/creds/wifi_pass` with payload `"NewPassword"` updates 
 
 ### `stat/stat.cpp`
 
-`stat` is the device-to-cloud publish channel. The handler file is not invoked from `mqtt_event_handler` (stat is publish-only — see the architecture diagram in [Section 11](#11-architecture--how-it-all-fits-together)); it instead exposes three functions called by `cmnd()`, `conf()`, and (eventually) the `loop()` heartbeat.
+`stat` is the device-to-cloud publish channel. The handler file is not invoked from `mqtt_event_handler` (stat is publish-only — see the architecture diagram in [Section 12](#12-architecture--how-it-all-fits-together)); it instead exposes three functions called by `cmnd()`, `conf()`, and (eventually) the `loop()` heartbeat.
 
 | Function | Topic | QoS | Retain | Caller |
 |---|---|---|---|---|
@@ -851,7 +862,72 @@ Header-only declaration with no `.cpp` implementation file yet. The sub-topic st
 
 ---
 
-## 10. Debug Command Handler — `src/cmd.cpp`
+## 10. Status LED — `src/statusManager/`
+
+The onboard WS2812 RGB LED on GPIO 10 (ESP32-C3-DevKitM-1 only — the WROVER does not have one wired) is driven as an at-a-glance operational indicator. The point is to be able to walk up to a deployed device on-site and immediately tell what state it is in without serial monitor or MQTT access.
+
+### State codes
+
+Defined in `statusManager.h` as `#define` constants:
+
+| Code | Name | Color | Meaning |
+|------|------|-------|---------|
+| `0`   | `STATE_BOOT`              | dim white | Set at the very top of `setup()`, before anything else |
+| `1`   | `STATE_WIFI_CONNECTING`   | yellow    | Set inside `initWiFiConnection()` and `checkWiFiStatus()` while attempting to (re)connect |
+| `2`   | `STATE_MQTT_CONNECTING`   | orange    | (Reserved — no current call site; reserved for "WiFi up, MQTT handshake in flight") |
+| `3`   | `STATE_MQTT_DISCONNECTED` | cyan      | `MQTT_EVENT_DISCONNECTED` — link to broker dropped, client is retrying |
+| `4`   | `STATE_ALL_IS_WELL`       | dim green | `MQTT_EVENT_CONNECTED` — full stack healthy |
+| `255` | `STATE_ERROR`             | solid red | Any unrecoverable error path — NVS validation failure, WiFi failure (about-to-reboot), `MQTT_EVENT_ERROR` |
+
+A single solid-red state covers all error paths intentionally: NVS-fail, WiFi-fail, and MQTT-error are not distinguishable on-site by colour alone anyway — they're distinguished by *when* they appear (reboot loop = NVS, fails immediately after yellow = WiFi, fails after green = MQTT).
+
+### GRB byte order
+
+The WS2812 LED on the C3-DevKitM-1 receives its bytes in **GRB** order. The Arduino `rgbLedWrite(pin, a, b, c)` API takes `a = green, b = red, c = blue`. So:
+
+| Color | `rgbLedWrite(LED_PIN, G, R, B)` |
+|-------|---------------------------------|
+| dim white | `(50, 50, 50)` |
+| yellow    | `(100, 100, 0)` — green + red, no blue |
+| orange    | `(40, 150, 0)` — red-heavy with a touch of green |
+| cyan      | `(100, 0, 100)` — green + blue, no red |
+| dim green | `(30, 0, 0)` |
+| solid red | `(0, 255, 0)` |
+
+The trap: `rgbLedWrite(LED_PIN, 0, 255, 0)` produces **red**, not green. The second arg is the R channel.
+
+### `statusHandler(u8_t statusCode)`
+
+The only public function. Switch-cases on the state code and writes the corresponding GRB triple to `LED_PIN` via `rgbLedWrite()`. Each call is one-shot — it sets the LED and returns. There is no animation tick, no background task, no state machine — calling `statusHandler(STATE_ERROR)` writes red once and the LED stays red until something else calls `statusHandler(...)` with a different state. The function is safe to call from any FreeRTOS task; concurrent calls might briefly tear the LED state but that resolves within one frame.
+
+### Call sites
+
+| Location | Call | When |
+|----------|------|------|
+| `main.cpp::setup()` (first line) | `statusHandler(STATE_BOOT)` | Very start of boot |
+| `config.cpp::getDeviceSpecificConfig()` × 3 reboot blocks | `statusHandler(STATE_ERROR)` | NVS validation or pinMapping read failure |
+| `wifiUtils/initWiFiConnection.cpp` entry | `statusHandler(STATE_WIFI_CONNECTING)` | Before the blocking connect loop |
+| `wifiUtils/initWiFiConnection.cpp` reboot branch | `statusHandler(STATE_ERROR)` | After 20 failed connect attempts |
+| `wifiUtils/checkWiFiStatus.cpp` | `statusHandler(STATE_WIFI_CONNECTING)` | Runtime WiFi loss detected (called from the 60 s `loop()` tick) |
+| `mqttManager.cpp` MQTT_EVENT_CONNECTED | `statusHandler(STATE_ALL_IS_WELL)` | Broker handshake succeeded |
+| `mqttManager.cpp` MQTT_EVENT_DISCONNECTED | `statusHandler(STATE_MQTT_DISCONNECTED)` | Broker connection dropped |
+| `mqttManager.cpp` MQTT_EVENT_ERROR | `statusHandler(STATE_ERROR)` | MQTT-level error event |
+
+### Recovery transitions
+
+There is no explicit "WiFi-came-back" or "we-just-fixed-it" call site. Recovery is implicit: when WiFi reconnects, the MQTT client eventually re-handshakes, `MQTT_EVENT_CONNECTED` fires, and that call resets the LED to dim green. This means after a network blip you may briefly see yellow / cyan / red until the full stack is healthy again — which is the honest behaviour.
+
+### Why this module looks slim
+
+An earlier iteration had a blink animation for the error state, driven from a `statusTick()` called per `loop()` iteration. That was removed because the only blinking state (`STATE_ERROR`) was already unambiguous as solid red — adding a tick + state flag + 1 Hz timer was carrying complexity for zero information. The current ~30-line `statusManager.cpp` is the simplest thing that does the job.
+
+### WROVER compatibility
+
+`LED_PIN = 10` is hard-coded for the C3-DevKitM-1's onboard LED. On the WROVER, GPIO 10 has nothing connected — `rgbLedWrite()` still runs through the RMT peripheral but produces no visible output. Safe to leave as-is; future WROVER hardware revisions can wire a status LED to GPIO 10 with no firmware change.
+
+---
+
+## 11. Debug Command Handler — `src/cmd.cpp`
 
 ```cpp
 void cmd(char *payload) { ... }
@@ -879,7 +955,7 @@ This is an **earlier, simpler command handler** that predates the structured `cm
 
 ---
 
-## 11. Architecture — How It All Fits Together
+## 12. Architecture — How It All Fits Together
 
 Two diagrams: the **system topology** below shows the three execution contexts (`setup()`, the Arduino `loop()` task, and the MQTT client FreeRTOS task) plus the external resources they touch (NVS, WiFi, the broker). The **message dispatch flow** further down zooms into what happens to each incoming topic — which handler runs, what state it mutates, and what gets published back.
 
@@ -896,10 +972,11 @@ flowchart TB
 
         subgraph SetupCtx["setup() — runs once on boot"]
             direction TB
-            cfg["getDeviceSpecificConfig()<br/>read NVS + validate<br/>alloc chargerPin[pinOffset]<br/>alloc lightPin[totalPins − pinOffset]<br/>alloc relayState[totalPins] (zeroed)"]
-            wifi["initWiFiConnection()<br/>persistent(false), autoReconnect(true)<br/>block until WL_CONNECTED / reboot after 20 fails"]
+            ledBoot["statusHandler(STATE_BOOT)<br/>LED → dim white"]
+            cfg["getDeviceSpecificConfig()<br/>read NVS + validate<br/>alloc chargerPin[pinOffset]<br/>alloc lightPin[totalPins − pinOffset]<br/>alloc relayState[totalPins] (zeroed)<br/>(on fail: LED → red, reboot)"]
+            wifi["initWiFiConnection()<br/>LED → yellow on entry<br/>persistent(false), autoReconnect(true)<br/>block until WL_CONNECTED / reboot after 20 fails<br/>(on fail: LED → red, reboot)"]
             mqttI["initMqtt()<br/>register mqtt_event_handler<br/>start MQTT FreeRTOS task"]
-            cfg --> wifi --> mqttI
+            ledBoot --> cfg --> wifi --> mqttI
         end
 
         subgraph LoopCtx["loop() — Arduino main task"]
@@ -912,10 +989,10 @@ flowchart TB
 
         subgraph EvtCtx["mqtt_event_handler() — MQTT FreeRTOS task"]
             direction TB
-            conn["CONNECTED:<br/>• publish 'Online' → testTopic<br/>• subscribe cmnd/&lt;user&gt;/# QoS 2<br/>• subscribe conf/&lt;user&gt;/# QoS 2<br/>• globalErrorCounter = 0"]
-            disc["DISCONNECTED:<br/>• log (client auto-reconnects)"]
+            conn["CONNECTED:<br/>• publish 'Online' → testTopic<br/>• subscribe cmnd/&lt;user&gt;/# QoS 2<br/>• subscribe conf/&lt;user&gt;/# QoS 2<br/>• globalErrorCounter = 0<br/>• LED → dim green (STATE_ALL_IS_WELL)"]
+            disc["DISCONNECTED:<br/>• log (client auto-reconnects)<br/>• LED → cyan (STATE_MQTT_DISCONNECTED)"]
             data["DATA:<br/>• tokenise on '/'<br/>• guard tokenCount &lt; 3<br/>• verify segment[1] == username<br/>• dispatch on segment[0]<br/>• (details ⇩ message flow)"]
-            err["ERROR:<br/>• globalErrorCounter++"]
+            err["ERROR:<br/>• globalErrorCounter++<br/>• LED → solid red (STATE_ERROR)"]
             conn --- disc --- data --- err
         end
 
@@ -1018,10 +1095,11 @@ A few invariants this picture encodes:
 - The cycle re-enable is owned by `loop()`, **not** by `cycle()` — that's why the cycle-watcher is in its own subgraph and reads/clears the cycle bookkeeping that `cycle()` armed.
 - `relayState[]` has three writers (`charger()`, `light()`, and the cycle-watcher in `loop()` via `charger()`) but only one reader on the publish side (`statState()`). It's the single source of truth for "what relays are currently on".
 - `stat/...` topics are **publish only** for the device — there is no subscription on `stat/<u>/#`, so the device never sees its own retained state.
+- The onboard status LED (driven via `statusHandler()` from `setup()`, both WiFi helpers, and all three MQTT events) is an **independent** side-channel — it does not appear in this dispatch flow because it is set as a side effect of the same code paths shown here. See [Section 10](#10-status-led--srcstatusmanager) for the colour-to-state mapping.
 
 ---
 
-## 12. NVS Provisioning
+## 13. NVS Provisioning
 
 NVS (Non-Volatile Storage) is an ESP32 key-value store in flash, in its own partition separate from the firmware. Before a device can be deployed, its NVS partition must be written with device-specific credentials and hardware configuration.
 
@@ -1071,7 +1149,7 @@ Both `nvs.csv` and `nvs.bin` are in `.gitignore` because they contain real WiFi 
 
 ---
 
-## 13. MQTT Topic Structure
+## 14. MQTT Topic Structure
 
 All topics follow the same top-level pattern:
 
@@ -1140,7 +1218,7 @@ conf/<device_id>/edit/<namespace>/<key>     payload=<value>   # NVS write, then 
 
 ---
 
-## 14. What Is Not Yet Implemented
+## 15. What Is Not Yet Implemented
 
 | Component | File | Status | Notes |
 |-----------|------|--------|-------|

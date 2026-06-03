@@ -1,8 +1,8 @@
-#ifndef CMD_H
-#define CMD_H
+// #ifndef CMD_H
+// #define CMD_H
 
-// DEPRECIATED
+// // DEPRECIATED
 
-void cmd(char *payload); 
+// void cmd(char *payload); 
 
-#endif
+// #endif

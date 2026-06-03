@@ -1,6 +1,8 @@
 #include "config.h"
 #include <Preferences.h>
 
+#include "statusManager/statusManager.h"
+
 const char* ca_cert = "-----BEGIN CERTIFICATE-----\n"
 "MIIDVTCCAj2gAwIBAgIUPvVD1r0tzEn/Ha5rRQ3uNTuDAlwwDQYJKoZIhvcNAQEL\n"
 "BQAwOjELMAkGA1UEBhMCTlAxETAPBgNVBAoMCEdyaWRGbG93MRgwFgYDVQQDDA9H\n"
@@ -59,8 +61,9 @@ void getDeviceSpecificConfig() {
     prefs.end();
 
     if(ssid.compareTo("readError") == 0 || wifiPassword.compareTo("readError") == 0 || username.compareTo("readError") == 0 || password.compareTo("readError") == 0 || totalPins > 16 || pinOffset > totalPins) {
+        statusHandler(STATE_ERROR);
         Serial.println("Could not, get the appropriate read value from NVS\nRecheck provisioned device specific config\nRebooting...");
-        delay(100);
+        delay(5000);
         ESP.restart();
 
     }
@@ -81,12 +84,14 @@ void getDeviceSpecificConfig() {
         chargerPin[i] = prefs.getUChar(tmp, 255);
 
         if(chargerPin[i] == 255) {
+            statusHandler(STATE_ERROR);
             Serial.println("Could not, get the appropriate read value from NVS\nRecheck provisioned device specific config\nRebooting...");
-            delay(100);
+            delay(5000);
             ESP.restart();
         }
 
         pinMode(chargerPin[i], OUTPUT);
+        digitalWrite(chargerPin[i], HIGH);
 
         i++;
     }
@@ -98,8 +103,9 @@ void getDeviceSpecificConfig() {
         lightPin[i] = prefs.getUChar(tmp, 255);
 
         if(lightPin[i] == 255) {
+            statusHandler(STATE_ERROR);
             Serial.println("Could not, get the appropriate read value from NVS\nRecheck provisioned device specific config\nRebooting...");
-            delay(100);
+            delay(5000);
             ESP.restart();
         }
 

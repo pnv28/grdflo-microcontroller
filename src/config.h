@@ -6,7 +6,7 @@
 // GPIO Pin Definition
 #define RED_PIN 21
 #define BLUE_PIN 21 // i know it is bricked
-#define LED_PIN 10
+
 
 // Max Segment
 #define MAX_SEGMENT 6

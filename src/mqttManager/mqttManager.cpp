@@ -2,13 +2,14 @@
 #include "cmd.h"
 #include "mqttManager.h"
 #include "mqtt_client.h"
-#include "ArduinoJson.h"
 
 // Calling different root topic handler
 #include "functions/cmnd/cmnd.h"
 #include "functions/stat/stat.h"
 #include "functions/tele/tele.h"
 #include "functions/conf/conf.h"
+
+#include "statusManager/statusManager.h"
 
 esp_mqtt_client_handle_t client;
 
@@ -24,11 +25,13 @@ static void mqtt_event_handler(void* handler_args, esp_event_base_t base, int32_
       String confTopic = "conf/" + username + "/#";
       esp_mqtt_client_subscribe(client, confTopic.c_str(), 2);
       globalErrorCounter = 0;
+      statusHandler(STATE_ALL_IS_WELL);
       }
       break;
 
     case MQTT_EVENT_DISCONNECTED:
       Serial.println("Disconnected from broker (auto-reconnecting...)");
+      statusHandler(STATE_MQTT_DISCONNECTED);
       break;
 
     case MQTT_EVENT_SUBSCRIBED:
@@ -78,6 +81,7 @@ static void mqtt_event_handler(void* handler_args, esp_event_base_t base, int32_
     }
 
     case MQTT_EVENT_ERROR:
+      statusHandler(STATE_ERROR);
       Serial.println("MQTT_EVENT_ERROR");
       globalErrorCounter++;
       break;
@@ -88,6 +92,7 @@ static void mqtt_event_handler(void* handler_args, esp_event_base_t base, int32_
 }
 
 void initMqtt() {
+  statusHandler(STATE_MQTT_CONNECTING);
   esp_mqtt_client_config_t mqtt_cfg = {};
   mqtt_cfg.session.keepalive = 20;
   mqtt_cfg.broker.address.uri = brokerUri;

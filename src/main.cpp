@@ -4,10 +4,13 @@
 #include "esp_task_wdt.h"
 
 #include "cmd.h"
-#include "wifiUtils.h"
+#include "wifiUtils/wifiUtils.h"
+#include "statusManager/statusManager.h"
+
 #include "mqttManager/mqttManager.h"
 #include "functions/cmnd/cmnd.h"
 #include "functions/stat/stat.h"
+
 
 esp_task_wdt_config_t wdt_cfg = {
   .timeout_ms     = 30000,
@@ -19,6 +22,7 @@ unsigned long prevMillis = 0;
 const unsigned long interval = 60000;
 
 void setup() {
+  statusHandler(STATE_BOOT);
   Serial.begin(115200);
 
   pinMode(RED_PIN, OUTPUT);

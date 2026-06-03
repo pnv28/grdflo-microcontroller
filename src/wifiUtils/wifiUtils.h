@@ -3,6 +3,7 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include "statusManager/statusManager.h"
 
 void initWiFiConnection(const char *ssid, const char *password);
 void checkWiFiStatus(const char *ssid, const char *password);

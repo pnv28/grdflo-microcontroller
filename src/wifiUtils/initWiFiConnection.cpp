@@ -1,6 +1,7 @@
 #include "wifiUtils.h"
 
 void initWiFiConnection(const char *ssid, const char *password) {
+    statusHandler(STATE_WIFI_CONNECTING);
     WiFi.setAutoReconnect(true);
     WiFi.persistent(false);
     WiFi.begin(ssid, password);
@@ -13,7 +14,9 @@ void initWiFiConnection(const char *ssid, const char *password) {
     }
 
     if (WiFi.status() != WL_CONNECTED) {
+        statusHandler(STATE_ERROR);
         Serial.println("WiFi failed, rebooting...");
+        delay(5000);
         ESP.restart();
     }
 
