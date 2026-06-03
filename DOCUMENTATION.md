@@ -1,6 +1,8 @@
 # GridFlow Microcontroller Firmware — Documentation
 
 > **Status: Work in progress.** The core WiFi + MQTT infrastructure is functional. The `cmnd` handler is partially implemented (`charger` and `light` done, `cycle` pending). The `stat`, `tele`, and `conf` message handlers are stubs yet to be implemented.
+>
+> **Current dev-time behaviour:** Inside `MQTT_EVENT_DATA`, both the topic tokenisation block and the routed dispatch into `cmnd/stat/tele/conf` are presently commented out. Every incoming message is instead forwarded to the legacy `cmd(payload)` debug handler in `src/cmd.cpp`. The structured routing code stays in the file (alongside the `tokenCount < 3` guard) and is intended to be re-enabled once the handler set is finalised.
 
 ---
 
@@ -290,7 +292,7 @@ prefs.end();
 | `offset`   | `pinOffset`  | How many of the connected relay channels are for charging    |
 | `totalPin` | `totalPins`  | Total number of relay channels physically wired to GPIO      |
 
-`totalPins` is the number of relay channels actually connected on this unit — the relay module supports up to 16 but a deployment might only wire up 4, 8, or any number. `pinOffset` is the split point within those connected channels: indices `0` to `pinOffset-1` go to the `chargePin` array, indices `pinOffset` to `totalPins-1` go to `lightPin`.
+`totalPins` is the number of relay channels actually connected on this unit — the relay module supports up to 16 but a deployment might only wire up 4, 8, or any number. `pinOffset` is the split point within those connected channels: indices `0` to `pinOffset-1` go to the `chargerPin` array, indices `pinOffset` to `totalPins-1` go to `lightPin`.
 
 **Why `getUChar` and not `getChar`?** `getChar` returns `int8_t` (signed, range -128 to 127). Passing `255` as the default would silently overflow to `-1` inside an `int8_t`. `getUChar` returns `uint8_t` (unsigned, range 0 to 255), so the default sentinel `255` is stored and returned correctly.
 
@@ -566,56 +568,65 @@ Prints `"Disconnected from broker (auto-reconnecting...)"`. The ESP-IDF MQTT cli
 
 Prints the message ID from the broker's SUBACK, confirming the subscription was accepted.
 
-**`MQTT_EVENT_DATA`** — The main message routing logic:
+**`MQTT_EVENT_DATA`** — Incoming message handling.
+
+The **current** dev-time flow is intentionally minimal: print the raw topic and payload, copy the payload into a null-terminated stack buffer, and hand it to the legacy `cmd()` debug handler. The full structured-routing block (topic tokenisation, device-ID verification, dispatch into `cmnd / stat / tele`) is staged in the same case but **commented out** while the handler set is being finalised.
 
 ```cpp
-// 1. Print raw topic and payload immediately using %.*s (length-bounded — no null terminator needed)
-Serial.printf("Message Received in topic %.*s: ", event->topic_len, event->topic);
-Serial.printf("%.*s\n", event->data_len, event->data);
+case MQTT_EVENT_DATA: {
+    // 1. Print raw topic + payload using %.*s (length-bounded — no null terminator needed)
+    Serial.printf("Message Received in topic %.*s: ", event->topic_len, event->topic);
+    Serial.printf("%.*s\n", event->data_len, event->data);
 
-// 2. Copy topic into a local null-terminated buffer (ESP-IDF does NOT null-terminate these)
-char topic[event->topic_len + 1];
-memcpy(topic, event->topic, event->topic_len);
-topic[event->topic_len] = '\0';
+    // --- structured routing (commented out for now) -----------------------
+    // char topic[event->topic_len + 1];
+    // memcpy(topic, event->topic, event->topic_len);
+    // topic[event->topic_len] = '\0';
+    //
+    // char *segment[MAX_SEGMENT];
+    // size_t tokenCount = 0;
+    // char *savePtr;
+    // char *token = strtok_r(topic, "/", &savePtr);
+    // while(token != NULL && tokenCount < MAX_SEGMENT) {
+    //     segment[tokenCount++] = token;
+    //     token = strtok_r(NULL, "/", &savePtr);
+    // }
+    // if (tokenCount < 3) return;   // guard — never touch segment[1] otherwise
+    // ----------------------------------------------------------------------
 
-// 3. Tokenise the topic by '/' into segments[]
-char *segment[MAX_SEGMENT];
-size_t tokenCount = 0;
-char *savePtr;
-char *token = strtok_r(topic, "/", &savePtr);
-while(token != NULL && tokenCount < MAX_SEGMENT) {
-    segment[tokenCount++] = token;
-    token = strtok_r(NULL, "/", &savePtr);
-}
+    // 2. Copy payload into a local null-terminated buffer
+    char payload[event->data_len + 1];
+    memcpy(payload, event->data, event->data_len);
+    payload[event->data_len] = '\0';
 
-// 4. Guard: require at least 3 segments (root/deviceID/subtopic) before routing
-if (tokenCount < 3) return;
+    // --- structured dispatch (commented out for now) ----------------------
+    // if(strcmp(segment[1], username.c_str()) == 0) {
+    //     // if(strcmp(segment[0], "cmnd") == 0) cmnd(segment, tokenCount, payload);
+    //     // if(strcmp(segment[0], "stat") == 0) stat(segment, tokenCount, payload);
+    //     // if(strcmp(segment[0], "tele") == 0) tele(segment, tokenCount, payload);
+    // } else {
+    //     Serial.println("Client ID Mismatch");
+    // }
+    // ----------------------------------------------------------------------
 
-// 5. Copy payload into a local null-terminated buffer
-char payload[event->data_len + 1];
-memcpy(payload, event->data, event->data_len);
-payload[event->data_len] = '\0';
-
-// 6. Verify segment[1] matches this device's ID, then route by segment[0]
-if(strcmp(segment[1], username.c_str()) == 0) {
-    // if(strcmp(segment[0], "cmnd") == 0) cmnd(segment, tokenCount, payload);
-    // if(strcmp(segment[0], "stat") == 0) stat(segment, tokenCount, payload);
-    // if(strcmp(segment[0], "tele") == 0) tele(segment, tokenCount, payload);
-} else {
-    Serial.println("Client ID Mismatch");
+    // 3. Active path today: hand the payload straight to the legacy debug handler.
+    cmd(payload);
+    break;
 }
 ```
 
 **Why manual null-termination?** The ESP-IDF MQTT event struct gives you `event->topic` (a raw pointer) and `event->topic_len` (an integer length). The pointer points into an internal buffer that is **not** null-terminated. Standard C string functions like `strtok_r` and `strcmp` require null-terminated strings, so the code manually copies the data into local stack arrays and appends `'\0'`. The initial `Serial.printf` avoids this copy by using `%.*s`, which takes an explicit length instead of relying on a null terminator.
 
-**Why `tokenCount < 3` before routing?** Every valid routable topic has at least 3 segments: `root/deviceID/subtopic`. Accessing `segment[1]` without knowing that at least 2 segments were parsed is undefined behaviour — the pointer would be uninitialised stack garbage. The guard ensures that before any segment is touched, the topic has the minimum required structure.
+**Why `tokenCount < 3` will guard routing once re-enabled?** Every valid routable topic has at least 3 segments: `root/deviceID/subtopic`. Accessing `segment[1]` without knowing that at least 2 segments were parsed is undefined behaviour — the pointer would be uninitialised stack garbage. The guard in the staged code ensures that before any segment is touched, the topic has the minimum required structure. (Note that this guard lives inside the commented block — it only becomes active when the block is uncommented.)
 
-**Topic routing logic:**
+**Topic routing logic (planned, currently inert):**
 - `segment[0]` — the root namespace: `cmnd`, `stat`, `tele`, or `conf`.
 - `segment[1]` — the device ID (verified against `username` to ensure this message is addressed to this device).
 - `segment[2+]` — sub-topic levels passed to the handler for further dispatch.
 
-All routing dispatch calls are currently commented out. `conf` is not yet wired up — `conf.h` is not included in `mqttManager.cpp` and the dispatch line has not been added.
+`conf` is not yet wired up — `conf.h` is not included in `mqttManager.cpp` and a dispatch line for it has not been added even inside the commented block.
+
+**Why this matters today:** Because dispatch falls through to `cmd(payload)` unconditionally, every retained or in-flight message on the currently-subscribed `topic` (the dev placeholder `"test"`) will be acted on — there is no device-ID filter in the active path. This is acceptable for bench work but must be replaced by the structured router before the device sees a production broker with other clients on shared topics.
 
 **`MQTT_EVENT_ERROR`**
 
@@ -708,7 +719,7 @@ Example: `cmnd/GF-B1/charger/1` with payload `1` closes charger relay 1 — sets
 
 Currently an **empty stub**. Intended for runtime configuration changes — for example, updating pin assignments or the charger/light split without re-flashing NVS.
 
-> **Note on future sensor support:** When physical sensors are added to the device, their GPIO pin assignments will likely need to be added to the NVS provisioning system similarly to how `chargePin` and `lightPin` are handled today. The `conf` handler and `getDeviceSpecificConfig()` will both need extending at that point.
+> **Note on future sensor support:** When physical sensors are added to the device, their GPIO pin assignments will likely need to be added to the NVS provisioning system similarly to how `chargerPin` and `lightPin` are handled today. The `conf` handler and `getDeviceSpecificConfig()` will both need extending at that point.
 
 ### `stat/stat.h` and `tele/tele.h`
 
@@ -746,61 +757,50 @@ This is an **earlier, simpler command handler** that predates the structured `cm
 
 ## 11. Architecture — How It All Fits Together
 
-```
-┌────────────────────────────────────────────────────────────┐
-│               ESP32-C3 / WROVER Device                     │
-│                                                            │
-│  setup()                                                   │
-│    │                                                       │
-│    ├─ getDeviceSpecificConfig()      ← NVS (flash)         │
-│    │     namespace "creds"                                 │
-│    │       ssid, wifiPassword, username, password          │
-│    │     namespace "pinDistribution"                       │
-│    │       totalPins (how many relay channels connected)   │
-│    │       pinOffset (how many of those are chargers)      │
-│    │     namespace "pinMapping"                            │
-│    │       keys "A"–"A+totalPins-1"                        │
-│    │       → chargerPin[pinOffset]       (heap-allocated)  │
-│    │       → lightPin[totalPins-pinOffset](heap-allocated) │
-│    │                                                       │
-│    ├─ initWiFiConnection()           ← 2.4 GHz WiFi        │
-│    │     persistent(false) + setAutoReconnect(true)        │
-│    │     blocks until connected / reboots after 20 tries   │
-│    │                                                       │
-│    └─ initMqtt()                     ← TLS TCP to broker   │
-│          registers mqtt_event_handler                      │
-│          starts MQTT client task (FreeRTOS)                │
-│                                                            │
-│  loop()  (Arduino main task)                               │
-│    │                                                       │
-│    ├─ esp_task_wdt_reset()           (every iteration)     │
-│    │                                                       │
-│    └─ every 60 s:                                          │
-│         ├─ print free heap                                 │
-│         └─ checkWiFiStatus()                               │
-│                                                            │
-│  mqtt_event_handler()  (MQTT client FreeRTOS task)         │
-│    │                                                       │
-│    ├─ CONNECTED    → publish Online + subscribe            │
-│    ├─ DISCONNECTED → log (client auto-reconnects)          │
-│    └─ DATA                                                 │
-│         ├─ print raw topic + payload                       │
-│         ├─ tokenise topic by '/'                           │
-│         ├─ guard: tokenCount < 3 → return                  │
-│         ├─ verify segment[1] == username                   │
-│         └─ route by segment[0]:   [ALL COMMENTED OUT]      │
-│              ├─ "cmnd" → cmnd()   [IMPLEMENTED]             │
-│              ├─ "stat" → stat()   [NOT IMPL]               │
-│              ├─ "tele" → tele()   [NOT IMPL]               │
-│              └─ "conf" → conf()   [NOT WIRED YET]          │
-│                                                            │
-└────────────────────────────────────────────────────────────┘
-               ↕  TLS/MQTT (port 8883)
-┌────────────────────────────────────────────────────────────┐
-│          EMQX Broker  (emqx.internal.grdflo.com)           │
-│    TLS cert signed by GridFlow-RootCA                      │
-│    Per-device auth: username + password                    │
-└────────────────────────────────────────────────────────────┘
+The diagram below shows the three execution contexts inside the device (`setup()`, the Arduino `loop()` task, and the MQTT client FreeRTOS task), the external resources each one touches (NVS, WiFi, the broker), and which dispatch paths inside `MQTT_EVENT_DATA` are currently live vs. staged.
+
+```mermaid
+flowchart TB
+    NVS[("NVS<br/>(flash)<br/>creds / pinDistribution / pinMapping")]
+    WiFiNet(("2.4 GHz<br/>WiFi"))
+    Broker[("EMQX Broker<br/>emqx.internal.grdflo.com:8883<br/>TLS cert: GridFlow-RootCA<br/>per-device username + password")]
+
+    subgraph Device["ESP32-C3 / WROVER Device"]
+        direction TB
+
+        subgraph SetupCtx["setup() — runs once on boot"]
+            direction TB
+            cfg["getDeviceSpecificConfig()<br/>reads NVS, validates,<br/>heap-allocates chargerPin[pinOffset]<br/>and lightPin[totalPins-pinOffset]"]
+            wifi["initWiFiConnection()<br/>persistent(false) + setAutoReconnect(true)<br/>blocks until connected / reboot after 20 tries"]
+            mqtt["initMqtt()<br/>registers mqtt_event_handler<br/>starts MQTT client task (FreeRTOS)"]
+            cfg --> wifi --> mqtt
+        end
+
+        subgraph LoopCtx["loop() — Arduino main task"]
+            direction TB
+            wdt["esp_task_wdt_reset() every iteration"]
+            interval["every 60 s:<br/>• print free heap<br/>• checkWiFiStatus()"]
+            wdt --> interval
+        end
+
+        subgraph EvtCtx["mqtt_event_handler() — MQTT client FreeRTOS task"]
+            direction TB
+            connected["CONNECTED → publish Online +<br/>subscribe to dev topic 'test'"]
+            disconnected["DISCONNECTED → log<br/>(client auto-reconnects)"]
+            data["DATA<br/>• print raw topic + payload<br/>• copy payload into null-terminated buffer<br/>• <b>cmd(payload)</b> &nbsp;← active today"]
+            staged["[STAGED, COMMENTED OUT]<br/>tokenise topic by '/'<br/>guard tokenCount &lt; 3<br/>verify segment[1] == username<br/>route by segment[0]:<br/>• cmnd → cmnd() &nbsp;[impl: charger, light]<br/>• stat → stat() &nbsp;[stub]<br/>• tele → tele() &nbsp;[stub]<br/>• conf → conf() &nbsp;[stub, not wired]"]
+            connected --- disconnected --- data
+            data -. "to be re-enabled" .-> staged
+        end
+
+        SetupCtx --> LoopCtx
+        SetupCtx --> EvtCtx
+    end
+
+    NVS -. read at boot .-> cfg
+    WiFiNet === wifi
+    mqtt == "TLS / MQTT&nbsp;:8883" ==> Broker
+    Broker == "messages" ==> data
 ```
 
 ---
@@ -910,12 +910,12 @@ Sub-topic levels for these three namespaces will be defined when the handlers ar
 | `stat` handler | `src/functions/stat/` | Header only | No `.cpp` file; topic structure not yet designed |
 | `tele` handler | `src/functions/tele/` | Header only | No `.cpp` file; sensors not yet connected |
 | `conf` handler | `src/functions/conf/conf.cpp` | Empty stub | Function signature exists, body is empty |
-| Topic routing activation | `mqttManager.cpp:59–61` | Commented out | The `cmnd`/`stat`/`tele` dispatch calls are commented out |
-| `conf` wiring into router | `mqttManager.cpp` | Not added | `conf.h` not yet `#include`d; dispatch line not added |
+| Topic tokenisation + routing | `mqttManager.cpp:36–64` | Commented out | The entire topic tokenisation block AND every dispatch call (`cmnd`/`stat`/`tele`) are commented out. The active path inside `MQTT_EVENT_DATA` is `cmd(payload)` on line 66 — every incoming message is forwarded to the legacy debug handler with no device-ID filter |
+| `conf` wiring into router | `mqttManager.cpp` | Not added | `conf.h` not yet `#include`d; no `conf()` dispatch line — not even in the commented block |
 | Last Will (LWT) | `mqttManager.cpp:90–95` | Commented out | Pending final `stat/` topic structure |
 | `MQTT_EVENT_ERROR` detail | `mqttManager.cpp:71` | Minimal | Only prints event name — actual reason from `error_handle` not extracted |
 | MQTT init null check | `mqttManager.cpp:97` | Missing | `esp_mqtt_client_init()` return value not checked for NULL |
-| VLA stack allocation | `mqttManager.cpp:36,54` | Present | `topic` and `payload` are variable-length stack arrays — valid as GCC extension but fragile; fixed-size buffers with explicit size checks would be safer |
+| VLA stack allocation | `mqttManager.cpp:54` | Present | `payload` is a variable-length stack array — valid as a GCC extension but fragile. (The matching `topic` VLA at line 36 lives inside the commented routing block and will re-appear when that block is re-enabled.) Fixed-size buffers with explicit size checks would be safer |
 | WDT reset in WiFi loop | `initWiFiConnection.cpp:9` | Missing | The blocking connect loop does not call `esp_task_wdt_reset()` — safe now (10 s < 30 s WDT), but fragile if the timeout or attempt count is ever increased |
 | Global error counter | `config.cpp`, `main.cpp` | Commented out | `globalErrorCount` mechanism disabled during development |
 | Dynamic topic construction | `config.cpp:28` | Placeholder | `topic = "test"` must be replaced with a topic built from `username` at runtime |
