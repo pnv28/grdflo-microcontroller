@@ -55,14 +55,14 @@ Each board has its own PlatformIO environment in `platformio.ini`. Switch betwee
 | Constant    | GPIO | Purpose                                   |
 |-------------|------|-------------------------------------------|
 | `LED_PIN`   | 10   | Addressable RGB LED (WS2812-type)         |
-| `RED_PIN`   | 20   | External red indicator LED / output       |
-| `BLUE_PIN`  | 5    | External blue indicator LED / output      |
+| `RED_PIN`   | 21   | External red indicator LED / output (currently parked on bricked pin) |
+| `BLUE_PIN`  | 21   | External blue indicator LED / output (currently parked on bricked pin) |
 
 All three constants are defined in `config.h`. These are fixed indicator and debug pins — not relay channels.
 
 > **GRB quirk (ESP32-C3 only):** The onboard RGB LED on the ESP32-C3-DevKitM-1 uses **GRB** byte order instead of the usual RGB. The `rgbLedWrite()` calls in `cmd.cpp` account for this — the second argument is Green, third is Red, fourth is Blue. The WROVER has no LED connected, so `LED_PIN` and all LED-related code in `cmd.cpp` have no effect on that board for now.
 
-> **Hardware note from pnv:** GPIO 21 may have been damaged on the original dev board (`// note i might have fried gpio pin 21`).
+> **Hardware note from pnv:** GPIO 21 on the original dev board is damaged. `RED_PIN` and `BLUE_PIN` are deliberately both pointed at 21 (`#define BLUE_PIN 21 // i know it is bricked`) so the legacy `cmd.cpp` debug commands cannot accidentally drive a working relay channel while the indicator-pin design is in flux.
 
 ### Relay Module
 
@@ -95,15 +95,15 @@ grdflo-microcontroller/
 │   │
 │   └── functions/                  # Handlers for each MQTT root topic
 │       ├── cmnd/
-│       │   ├── cmnd.h              # Declaration for cmnd() handler
-│       │   └── cmnd.cpp            # [STUB] Processes incoming cmnd/<id>/... messages
+│       │   ├── cmnd.h              # cmnd() + charger() declarations, extern cycleID
+│       │   └── cmnd.cpp            # charger/light/cycle relay control + cycle globals
 │       ├── stat/
 │       │   └── stat.h              # Declaration for stat() handler — no .cpp yet
 │       ├── tele/
 │       │   └── tele.h              # Declaration for tele() handler — no .cpp yet
 │       └── conf/
 │           ├── conf.h              # Declaration for conf() handler
-│           └── conf.cpp            # [STUB] Processes incoming conf/<id>/... messages
+│           └── conf.cpp            # [STUB] Empty body; not yet wired into mqttManager
 │
 ├── lib/                            # Project-private libraries (compiled separately by PlatformIO)
 │   └── wifiUtils/
@@ -178,32 +178,42 @@ These two files together define all the **global state** of the device.
 ### `config.h` — Declarations
 
 ```cpp
-#define RED_PIN      20
-#define BLUE_PIN      5
+#define RED_PIN      21
+#define BLUE_PIN     21    // i know it is bricked
 #define LED_PIN      10
 #define MAX_SEGMENT   6
 ```
 
-- `RED_PIN` / `BLUE_PIN` / `LED_PIN`: GPIO numbers for the indicator pins.
-- `MAX_SEGMENT`: The maximum number of `/`-separated segments the firmware will parse from an incoming MQTT topic string. A topic like `cmnd/GF-B1/charge/0` has 4 segments. Setting this to 6 gives a safe upper bound without unbounded allocation.
+- `RED_PIN` / `BLUE_PIN` / `LED_PIN`: GPIO numbers for the indicator pins. Both indicator constants currently point at the bricked GPIO 21 — see [Section 2](#2-hardware) for the reason.
+- `MAX_SEGMENT`: The maximum number of `/`-separated segments the firmware will parse from an incoming MQTT topic string. A topic like `cmnd/GF-B1/charger/0/cycle` has 5 segments; the upper bound of 6 accommodates the longest currently-routed form (`cmnd/<dev>/charger/<id>/cycle`).
 
 The header also `extern`-declares every global variable that other `.cpp` files need to access:
 
 ```cpp
-extern const char* ca_cert;       // TLS root certificate (PEM format)
-extern const char* brokerUri;     // MQTT broker URI
-extern const char* topic;         // Default MQTT topic (temporary / dev)
-extern String ssid;               // WiFi network name — loaded from NVS
-extern String wifiPassword;       // WiFi password — loaded from NVS
-extern String username;           // Device ID — MQTT client ID and username
-extern String password;           // MQTT password for this device
-extern u8_t pinOffset;            // How many of totalPins are charger channels
-extern u8_t totalPins;            // Total relay channels physically wired to GPIO
-extern int *chargerPin;           // Dynamically allocated array of charger relay GPIO numbers
-extern int *lightPin;             // Dynamically allocated array of light relay GPIO numbers
+extern const char* ca_cert;            // TLS root certificate (PEM format)
+extern unsigned int globalErrorCounter; // MQTT error count — triggers reboot at 5
+
+extern String ssid;                    // WiFi network name — loaded from NVS
+extern String wifiPassword;            // WiFi password — loaded from NVS
+
+extern const char* brokerUri;          // MQTT broker URI
+extern const char* testTopic;          // Dev/test MQTT topic ("test") used for the online announce
+extern String username;                // Device ID — MQTT client ID and username
+extern String password;                // MQTT password for this device
+
+extern u8_t pinOffset;                 // How many of totalPins are charger channels
+extern u8_t totalPins;                 // Total relay channels physically wired to GPIO
+extern int *chargerPin;                // Dynamically allocated array of charger relay GPIO numbers
+extern int *lightPin;                  // Dynamically allocated array of light relay GPIO numbers
+
+extern unsigned long cycleInterval;    // Cycle-command duration in ms (set by cycle())
+extern unsigned long cycleStart;       // millis() timestamp when cycle was armed
+extern bool cycleFlag;                 // true while a cycle is in flight
 ```
 
-**Why `extern`?** Without it, every `.cpp` file that includes `config.h` would create its own separate copy of each variable — multiple definitions of the same symbol. The linker would either error or silently give each file its own independent variable, meaning changes in one file would not be visible in another. `extern` separates the *declaration* (which goes in the header — "this variable exists somewhere") from the *definition* (which goes in `config.cpp` — "this is the one actual variable in memory"). Every file that includes `config.h` gets a reference to the same single variable defined in `config.cpp`, with no duplication and no wasted memory.
+**Why `extern`?** Without it, every `.cpp` file that includes `config.h` would create its own separate copy of each variable — multiple definitions of the same symbol. The linker would either error or silently give each file its own independent variable, meaning changes in one file would not be visible in another. `extern` separates the *declaration* (which goes in the header — "this variable exists somewhere") from the *definition* (which goes in a `.cpp` — "this is the one actual variable in memory"). Every file that includes `config.h` gets a reference to the same single underlying variable, with no duplication and no wasted memory.
+
+**Where the definitions actually live.** Most of these globals are defined in `config.cpp`. The three cycle-related globals — `cycleInterval`, `cycleStart`, `cycleFlag` — are defined in `src/functions/cmnd/cmnd.cpp` alongside the `cycle()` function that owns them. They are still declared `extern` in `config.h` so `main.cpp` can read them in `loop()`. There is also a `cycleID` integer (the charger index currently being cycled) declared `extern` in `cmnd.h` and defined in `cmnd.cpp` — kept out of `config.h` because only `cmnd.cpp` and the loop's cycle-watcher need it.
 
 **Why pointers for `chargerPin` and `lightPin`?** The size of these arrays is only known at boot time after reading `totalPins` and `pinOffset` from NVS. A fixed-size declaration like `int chargerPin[16]` would always allocate 16 integers regardless of how many relay channels are actually connected — wasting memory. Dynamic allocation with `new int[pinOffset]` and `new int[totalPins - pinOffset]` sizes them to exactly what this particular deployment needs.
 
@@ -227,13 +237,21 @@ const char* brokerUri = "mqtts://emqx.internal.grdflo.com:8883";
 - `emqx.internal.grdflo.com` — internal (private network) EMQX broker.
 - Port `8883` — the standard MQTTS port.
 
-#### `topic`
+#### `testTopic`
 
 ```cpp
-const char* topic = "test";
+const char* testTopic = "test";
 ```
 
-Temporary development placeholder. The real per-device topic (see [Section 13](#13-mqtt-topic-structure)) needs to be built at runtime from `username` and will replace this.
+Development placeholder used as the topic for the "Online" announce in `MQTT_EVENT_CONNECTED`. The real per-device control topic (see [Section 13](#13-mqtt-topic-structure)) is **already** built at runtime from `username` and subscribed to as `cmnd/<username>/#` — `testTopic` only remains for the boot-time online ping and will be removed once the `stat/` namespace is finalised.
+
+#### `globalErrorCounter`
+
+```cpp
+unsigned int globalErrorCounter = 0;
+```
+
+Counts MQTT-level errors raised via `MQTT_EVENT_ERROR`. The 60-second tick in `loop()` checks this counter and reboots the device if it has reached 5, so a long-lived broker problem self-recovers without manual intervention. The counter is reset to 0 inside `MQTT_EVENT_CONNECTED`, so a successful reconnect after a transient error clears the error budget.
 
 ---
 
@@ -413,28 +431,41 @@ Runs once on power-on / reset. Execution order matters here:
 
 ### `loop()`
 
-Runs continuously after `setup()`. It is intentionally minimal:
+Runs continuously after `setup()`. It has two responsibilities — pet the watchdog and run two independent non-blocking timers:
 
 ```cpp
 void loop() {
-  esp_task_wdt_reset();           // Pet the watchdog — must be called at least every 30 s
+  esp_task_wdt_reset();
   unsigned long currMillis = millis();
 
-  if((currMillis - prevMillis) >= interval) {   // Every 60 seconds:
+  if(cycleFlag) {
+    if((currMillis - cycleStart) >= cycleInterval) {
+      Serial.printf("Cycle fired: charger %d re-enabling after %lu ms\n", cycleID, cycleInterval);
+      charger(cycleID, true);
+      cycleFlag = false;
+    }
+  }
+
+  if((currMillis - prevMillis) >= interval) {
     prevMillis = currMillis;
-    Serial.printf("Free heap: %d bytes", ESP.getFreeHeap());
+    Serial.printf("Free heap: %d bytes\n", ESP.getFreeHeap());
+
+    if(globalErrorCounter >= 5) {
+      ESP.restart();
+    }
+
     checkWiFiStatus(ssid.c_str(), wifiPassword.c_str());
   }
 }
 ```
 
-The `millis()` / `prevMillis` pattern is a **non-blocking interval timer** — it avoids `delay()`, which would block the watchdog reset call and eventually trigger a panic. Every 60 seconds:
+The `millis()` / timestamp pattern is a **non-blocking interval timer** — it avoids `delay()`, which would block the watchdog reset and eventually trigger a panic.
 
-- The free heap size is printed to serial (useful for detecting slow memory leaks over time).
-- `checkWiFiStatus()` is called to detect and recover from WiFi disconnections.
+**Cycle re-enable block.** `cycleFlag` is set by `cycle()` in `cmnd.cpp` when a cycle command arrives. `cycle()` turns the targeted charger OFF, records `cycleStart = millis()` and the requested duration `cycleInterval` (in ms), and remembers which charger via `cycleID`. The loop then watches that timestamp: when `currMillis - cycleStart >= cycleInterval`, the charger is turned back ON and the flag is cleared. Unsigned subtraction makes this rollover-safe past the 49-day `millis()` wrap. Only one cycle can be in flight at a time — see [Section 9](#9-topic-routing--srcfunctions).
 
-**Commented-out code in `loop()`:**
-A `globalErrorCount` mechanism was in development — it tracked MQTT errors and would trigger a reboot after 5 consecutive failures. Both the counter and the reboot check are commented out while the overall error handling strategy is being designed.
+**60-second heartbeat.** Every minute the loop prints free heap (slow memory-leak detection), checks the error-counter budget, and calls `checkWiFiStatus()` to recover from WiFi loss.
+
+**Error-counter reboot.** `globalErrorCounter` is incremented from `MQTT_EVENT_ERROR` in the MQTT task and reset to 0 from `MQTT_EVENT_CONNECTED`. If it crosses the threshold of 5 between two heartbeat ticks without a successful reconnect resetting it, the device hard-reboots via `ESP.restart()`. This is the application-layer self-recovery for cases where the MQTT client is producing errors but the WiFi link itself looks healthy.
 
 ---
 
@@ -549,16 +580,19 @@ This is a **FreeRTOS event handler callback** — it runs on the MQTT client's i
 
 ```cpp
 Serial.println("Connected to GridFlow EMQX Server");
-esp_mqtt_client_enqueue(client, topic, "GF-KD1-Test --> Online", 0, 0, 0, true);
-esp_mqtt_client_subscribe(client, topic, 2);
+esp_mqtt_client_enqueue(client, testTopic, "GF-KD1-Test --> Online", 0, 0, 0, true);
+String cmndTopic = "cmnd/" + username + "/#";
+esp_mqtt_client_subscribe(client, cmndTopic.c_str(), 2);
+globalErrorCounter = 0;
 ```
 
 When the client successfully connects to the broker:
 1. Prints a confirmation to serial.
-2. Publishes an "Online" announcement to the dev topic.
-3. Subscribes to the dev topic at QoS 2 (exactly-once delivery).
+2. Publishes a retained "Online" announcement to the dev `testTopic` ("test").
+3. Builds the per-device wildcard subscription `cmnd/<username>/#` at runtime and subscribes at QoS 2 (exactly-once delivery). This catches every `cmnd/<this-device>/...` topic the broker routes to it, including the future `cycle` subtopics.
+4. Resets `globalErrorCounter` to 0 — a successful (re)connect clears the error budget that drives the auto-reboot in `loop()`.
 
-In the production design, this will subscribe to the per-device `cmnd/` and `conf/` topics built from `username`.
+A separate `conf/` subscription is still TODO — `conf.h` is not yet wired into the dispatcher.
 
 **`MQTT_EVENT_DISCONNECTED`**
 
@@ -570,67 +604,72 @@ Prints the message ID from the broker's SUBACK, confirming the subscription was 
 
 **`MQTT_EVENT_DATA`** — Incoming message handling.
 
-The **current** dev-time flow is intentionally minimal: print the raw topic and payload, copy the payload into a null-terminated stack buffer, and hand it to the legacy `cmd()` debug handler. The full structured-routing block (topic tokenisation, device-ID verification, dispatch into `cmnd / stat / tele`) is staged in the same case but **commented out** while the handler set is being finalised.
+This is the structured router. The topic is tokenised on `/` into a fixed-size `segment[]` array, the device-ID is verified, and the message is dispatched to the per-root handler. The legacy `cmd(payload)` debug call now lives in a `/* ... */` block beneath the router and is no longer reached.
 
 ```cpp
 case MQTT_EVENT_DATA: {
-    // 1. Print raw topic + payload using %.*s (length-bounded — no null terminator needed)
     Serial.printf("Message Received in topic %.*s: ", event->topic_len, event->topic);
     Serial.printf("%.*s\n", event->data_len, event->data);
 
-    // --- structured routing (commented out for now) -----------------------
-    // char topic[event->topic_len + 1];
-    // memcpy(topic, event->topic, event->topic_len);
-    // topic[event->topic_len] = '\0';
-    //
-    // char *segment[MAX_SEGMENT];
-    // size_t tokenCount = 0;
-    // char *savePtr;
-    // char *token = strtok_r(topic, "/", &savePtr);
-    // while(token != NULL && tokenCount < MAX_SEGMENT) {
-    //     segment[tokenCount++] = token;
-    //     token = strtok_r(NULL, "/", &savePtr);
-    // }
-    // if (tokenCount < 3) return;   // guard — never touch segment[1] otherwise
-    // ----------------------------------------------------------------------
+    char topic[event->topic_len + 1];
+    memcpy(topic, event->topic, event->topic_len);
+    topic[event->topic_len] = '\0';
 
-    // 2. Copy payload into a local null-terminated buffer
+    char *segment[MAX_SEGMENT];
+    size_t tokenCount = 0;
+    char *savePtr;
+    char *token = strtok_r(topic, "/", &savePtr);
+    while(token != NULL && tokenCount < MAX_SEGMENT) {
+        segment[tokenCount++] = token;
+        token = strtok_r(NULL, "/", &savePtr);
+    }
+
+    if (tokenCount < 4) return;
+
     char payload[event->data_len + 1];
     memcpy(payload, event->data, event->data_len);
     payload[event->data_len] = '\0';
 
-    // --- structured dispatch (commented out for now) ----------------------
-    // if(strcmp(segment[1], username.c_str()) == 0) {
-    //     // if(strcmp(segment[0], "cmnd") == 0) cmnd(segment, tokenCount, payload);
-    //     // if(strcmp(segment[0], "stat") == 0) stat(segment, tokenCount, payload);
-    //     // if(strcmp(segment[0], "tele") == 0) tele(segment, tokenCount, payload);
-    // } else {
-    //     Serial.println("Client ID Mismatch");
-    // }
-    // ----------------------------------------------------------------------
+    if(strcmp(segment[1], username.c_str()) == 0) {
+        if(strcmp(segment[0], "cmnd") == 0) cmnd(segment, tokenCount, payload);
+        // if(strcmp(segment[0], "stat") == 0) stat(segment, tokenCount, payload);
+        // if(strcmp(segment[0], "tele") == 0) tele(segment, tokenCount, payload);
+    } else {
+        Serial.println("Client ID Mismatch");
+    }
 
-    // 3. Active path today: hand the payload straight to the legacy debug handler.
+    /*
+    DEPRECIATED
     cmd(payload);
+    */
+
     break;
 }
 ```
 
 **Why manual null-termination?** The ESP-IDF MQTT event struct gives you `event->topic` (a raw pointer) and `event->topic_len` (an integer length). The pointer points into an internal buffer that is **not** null-terminated. Standard C string functions like `strtok_r` and `strcmp` require null-terminated strings, so the code manually copies the data into local stack arrays and appends `'\0'`. The initial `Serial.printf` avoids this copy by using `%.*s`, which takes an explicit length instead of relying on a null terminator.
 
-**Why `tokenCount < 3` will guard routing once re-enabled?** Every valid routable topic has at least 3 segments: `root/deviceID/subtopic`. Accessing `segment[1]` without knowing that at least 2 segments were parsed is undefined behaviour — the pointer would be uninitialised stack garbage. The guard in the staged code ensures that before any segment is touched, the topic has the minimum required structure. (Note that this guard lives inside the commented block — it only becomes active when the block is uncommented.)
+**Why `tokenCount < 4`?** Every valid routable topic has at least 4 segments — for `cmnd`, the structure is `cmnd/<dev>/<group>/<channelID>`, which is 4 tokens. Accessing `segment[3]` without proof that at least 4 segments were parsed would be reading uninitialised stack memory. The guard is intentionally a hard `< 4` (not `< 3`) because every currently-routed handler needs `segment[3]`. Handlers that need **more** than 4 segments (e.g. the cycle sub-command which uses `segment[4]`) must do their own additional length check inside the handler — see `cmnd.cpp:18` (`seg_len >= 5`).
 
-**Topic routing logic (planned, currently inert):**
+**Topic routing logic:**
 - `segment[0]` — the root namespace: `cmnd`, `stat`, `tele`, or `conf`.
 - `segment[1]` — the device ID (verified against `username` to ensure this message is addressed to this device).
 - `segment[2+]` — sub-topic levels passed to the handler for further dispatch.
 
-`conf` is not yet wired up — `conf.h` is not included in `mqttManager.cpp` and a dispatch line for it has not been added even inside the commented block.
+Only the `cmnd` dispatch is currently live. `stat`/`tele` are present as commented lines so they can be activated as their handlers ship; `conf` is not wired up at all yet (its `#include` is missing and there is no dispatch line, not even commented).
 
-**Why this matters today:** Because dispatch falls through to `cmd(payload)` unconditionally, every retained or in-flight message on the currently-subscribed `topic` (the dev placeholder `"test"`) will be acted on — there is no device-ID filter in the active path. This is acceptable for bench work but must be replaced by the structured router before the device sees a production broker with other clients on shared topics.
+**Device-ID filter is active.** Because the broker subscription is `cmnd/<this-device>/#`, the broker should never deliver a message addressed to another device. The `segment[1] == username` check is a defence-in-depth — if a misconfigured ACL or a wildcard subscription ever leaks another device's traffic to this client, the `Client ID Mismatch` log makes it visible.
 
 **`MQTT_EVENT_ERROR`**
 
-Prints `"MQTT_EVENT_ERROR"`. The actual error reason (TLS failure, connection refused, socket error) is available in `event->error_handle` but is not yet extracted and logged. The commented-out `globalErrorCount++` was going to feed into the reboot-on-N-errors mechanism in `loop()`.
+```cpp
+case MQTT_EVENT_ERROR:
+    Serial.println("MQTT_EVENT_ERROR");
+    globalErrorCounter++;
+    break;
+```
+
+Prints `"MQTT_EVENT_ERROR"` and bumps `globalErrorCounter`. The actual error reason (TLS failure, connection refused, socket error) is available in `event->error_handle` but is not yet extracted and logged. The error-counter feeds the 60-second auto-reboot check in `loop()` — see [Section 6](#6-entry-point--maincpp).
 
 **`default`**
 
@@ -689,31 +728,52 @@ void conf (char *segment[], const size_t seg_len, const char *payload);
 
 ### `cmnd/cmnd.cpp`
 
-Partially implemented. The topic structure for `cmnd` is:
+The topic structures for `cmnd` are:
 
 ```
-cmnd/<device_id>/(charger|light)/<channelID>
+cmnd/<device_id>/(charger|light)/<channelID>          # on/off
+cmnd/<device_id>/charger/<channelID>/cycle            # timed off-then-on
 ```
 
-`segment[2]` selects the relay group (`charger` or `light`). `segment[3]` is the zero-based channel index within that group — `0` through `pinOffset-1` for chargers, `0` through `totalPins-pinOffset-1` for lights. The payload is `1` (relay HIGH) or `0` (relay LOW).
+`segment[2]` selects the relay group (`charger` or `light`). `segment[3]` is the zero-based channel index within that group — `0` through `pinOffset-1` for chargers, `0` through `totalPins-pinOffset-1` for lights. `segment[4]`, when present, selects a sub-command (currently only `cycle`).
 
-`cmnd()` routes to one of two internal functions:
+`cmnd()` dispatches to one of three internal functions:
 
 **`charger(int chargerID, bool state)`**
 - Bounds-checks `chargerID >= pinOffset` and returns `-1` if out of range.
 - Calls `digitalWrite(chargerPin[chargerID], HIGH/LOW)` based on `state`.
+- Logs `Charger <id> (GPIO <n>) -> ON/OFF` to serial for every transition.
 - Returns `0` on success.
 
 **`light(int lightID, bool state)`**
 - Bounds-checks `lightID >= (totalPins - pinOffset)` and returns `-1` if out of range.
 - Calls `digitalWrite(lightPin[lightID], HIGH/LOW)` based on `state`.
+- Logs `Light <id> (GPIO <n>) -> ON/OFF` to serial for every transition.
 - Returns `0` on success.
 
 Both `segment[3]` and `payload` are passed through `atoi()` at the call site — `segment[3]` is the channel index as a string (e.g., `"2"`), and `payload` is `"1"` or `"0"`. `atoi()` converts both to integers; the integer `0`/`1` then implicitly converts to `bool` for the `state` parameter.
 
+> **Payload caveat:** `atoi()` returns 0 for any non-numeric string. So `"1"` → ON, `"0"` → OFF, but `"ON"` / `"OFF"` / `"on"` / `"off"` all parse as 0 and turn the relay OFF. Use numeric payloads only, or replace the `atoi()` parse with `strcmp()` / JSON if word-form payloads need to be supported.
+
 Example: `cmnd/GF-B1/charger/1` with payload `1` closes charger relay 1 — sets `chargerPin[1]` HIGH.
 
-**`cycle(unsigned int timeInSeconds)`** — forward-declared but not yet implemented. Intended to turn a relay on for a set duration then off automatically.
+**`cycle(unsigned int timeInSeconds, char *segment[])`** — timed off-then-on cycle for one charger channel. Used to drop and re-energise a charger after a fixed delay (e.g. to reset a downstream device or to throttle current draw).
+
+- Topic: `cmnd/<dev>/charger/<id>/cycle`
+- Payload: integer **seconds** (the delay between off and re-on). The payload is multiplied by 1000 to give the internal `cycleInterval` in ms.
+
+The arming sequence inside `cycle()`:
+1. Set `cycleFlag = true`.
+2. Immediately call `charger(chargerID, false)` to drop the relay.
+3. Record `cycleID = chargerID` and `cycleStart = millis()`.
+4. Log `Cycle started: charger <id>, interval <ms> ms`.
+
+The re-enable happens **outside** this function, in `main.cpp`'s `loop()`. The loop watches `cycleFlag` and, when `millis() - cycleStart >= cycleInterval`, re-energises the charger via `charger(cycleID, true)` and clears the flag. This split keeps `cycle()` non-blocking — the MQTT task returns immediately and the watchdog is unaffected even for long cycle durations.
+
+Constraints to know about:
+- **One cycle at a time.** `cycleFlag` / `cycleID` / `cycleStart` / `cycleInterval` are scalars, so a second cycle command (on any charger) while a first is in flight overwrites the first one's bookkeeping — the first charger never gets re-enabled. If concurrent cycles per channel are ever needed, these globals have to become per-channel arrays.
+- **Cycle is only valid for chargers**, not lights. Sending `cmnd/<dev>/light/<id>/cycle` does not match the dispatch.
+- **Guard tightness.** The handler accepts the cycle path when `seg_len >= 5`. A malformed `cmnd/<dev>/charger/<id>/cycle` with no payload (or a non-numeric payload) parses to a 0-ms cycle, which the loop will fire on the very next iteration — visible as an off-then-on flicker.
 
 ### `conf/conf.cpp`
 
@@ -757,7 +817,7 @@ This is an **earlier, simpler command handler** that predates the structured `cm
 
 ## 11. Architecture — How It All Fits Together
 
-The diagram below shows the three execution contexts inside the device (`setup()`, the Arduino `loop()` task, and the MQTT client FreeRTOS task), the external resources each one touches (NVS, WiFi, the broker), and which dispatch paths inside `MQTT_EVENT_DATA` are currently live vs. staged.
+The diagram below shows the three execution contexts inside the device (`setup()`, the Arduino `loop()` task, and the MQTT client FreeRTOS task), the external resources each one touches (NVS, WiFi, the broker), and which dispatch paths inside `MQTT_EVENT_DATA` are currently active vs. stubbed.
 
 ```mermaid
 flowchart TB
@@ -779,18 +839,20 @@ flowchart TB
         subgraph LoopCtx["loop() — Arduino main task"]
             direction TB
             wdt["esp_task_wdt_reset() every iteration"]
-            interval["every 60 s:<br/>• print free heap<br/>• checkWiFiStatus()"]
-            wdt --> interval
+            cycleWatch["if cycleFlag and<br/>millis() − cycleStart ≥ cycleInterval:<br/>• charger(cycleID, true)<br/>• cycleFlag = false"]
+            interval["every 60 s:<br/>• print free heap<br/>• reboot if globalErrorCounter ≥ 5<br/>• checkWiFiStatus()"]
+            wdt --> cycleWatch --> interval
         end
 
         subgraph EvtCtx["mqtt_event_handler() — MQTT client FreeRTOS task"]
             direction TB
-            connected["CONNECTED → publish Online +<br/>subscribe to dev topic 'test'"]
+            connected["CONNECTED →<br/>• publish Online to testTopic<br/>• subscribe cmnd/&lt;username&gt;/#  QoS 2<br/>• globalErrorCounter = 0"]
             disconnected["DISCONNECTED → log<br/>(client auto-reconnects)"]
-            data["DATA<br/>• print raw topic + payload<br/>• copy payload into null-terminated buffer<br/>• <b>cmd(payload)</b> &nbsp;← active today"]
-            staged["[STAGED, COMMENTED OUT]<br/>tokenise topic by '/'<br/>guard tokenCount &lt; 3<br/>verify segment[1] == username<br/>route by segment[0]:<br/>• cmnd → cmnd() &nbsp;[impl: charger, light]<br/>• stat → stat() &nbsp;[stub]<br/>• tele → tele() &nbsp;[stub]<br/>• conf → conf() &nbsp;[stub, not wired]"]
-            connected --- disconnected --- data
-            data -. "to be re-enabled" .-> staged
+            data["DATA<br/>• tokenise topic on '/' into segment[]<br/>• guard tokenCount &lt; 4<br/>• verify segment[1] == username<br/>• dispatch by segment[0]:<br/>&nbsp;&nbsp;• cmnd → <b>cmnd()</b> &nbsp;[active — charger / light / cycle]<br/>&nbsp;&nbsp;• stat → stat() &nbsp;[stub, commented]<br/>&nbsp;&nbsp;• tele → tele() &nbsp;[stub, commented]<br/>&nbsp;&nbsp;• conf → not wired"]
+            errored["ERROR → globalErrorCounter++"]
+            legacy["[DEPRECATED]<br/>cmd(payload) — block-commented, no longer reached"]
+            connected --- disconnected --- data --- errored
+            data -. "deprecated path" .-> legacy
         end
 
         SetupCtx --> LoopCtx
@@ -871,8 +933,8 @@ Where:
 The **segment array** passed to each handler maps as:
 
 ```
-topic:    cmnd  /  GF-B1  /  charge  /  1
-index:      0       1          2         3
+topic:    cmnd  /  GF-B1  /  charger  /  1
+index:      0       1          2          3
 ```
 
 So `segment[0]` = root, `segment[1]` = device ID, `segment[2+]` = action-specific path.
@@ -880,15 +942,19 @@ So `segment[0]` = root, `segment[1]` = device ID, `segment[2+]` = action-specifi
 ### `cmnd` topic structure
 
 ```
-cmnd/<device_id>/(charger|light)/<channelID>
+cmnd/<device_id>/(charger|light)/<channelID>          # on/off
+cmnd/<device_id>/charger/<channelID>/cycle            # timed off-then-on
 ```
 
-| Topic | Direction | Meaning |
-|-------|-----------|---------|
-| `cmnd/GF-B1/charger/0` | Cloud → Device | Control charger relay 0 |
-| `cmnd/GF-B1/charger/1` | Cloud → Device | Control charger relay 1 |
-| `cmnd/GF-B1/light/0`   | Cloud → Device | Control light relay 0 |
-| `cmnd/GF-B1/light/1`   | Cloud → Device | Control light relay 1 |
+| Topic | Payload | Direction | Meaning |
+|-------|---------|-----------|---------|
+| `cmnd/GF-B1/charger/0` | `"1"` / `"0"` | Cloud → Device | Set charger relay 0 ON / OFF |
+| `cmnd/GF-B1/charger/1` | `"1"` / `"0"` | Cloud → Device | Set charger relay 1 ON / OFF |
+| `cmnd/GF-B1/light/0`   | `"1"` / `"0"` | Cloud → Device | Set light relay 0 ON / OFF |
+| `cmnd/GF-B1/light/1`   | `"1"` / `"0"` | Cloud → Device | Set light relay 1 ON / OFF |
+| `cmnd/GF-B1/charger/0/cycle` | `"<seconds>"` (e.g. `"5"`) | Cloud → Device | Drop charger 0, then re-energise after N seconds. Non-blocking. |
+
+Payload semantics: numeric only. `atoi()` is used for parsing, so `"ON"`/`"OFF"` parse as 0 and turn the relay OFF — use `"1"`/`"0"` for on/off, and a positive integer for `cycle`.
 
 ### `stat`, `tele`, `conf` topic structure (not yet designed)
 
@@ -906,19 +972,18 @@ Sub-topic levels for these three namespaces will be defined when the handlers ar
 
 | Component | File | Status | Notes |
 |-----------|------|--------|-------|
-| `cmnd` handler — `cycle()` | `src/functions/cmnd/cmnd.cpp` | Partial | `charger()` and `light()` implemented; `cycle()` forward-declared, not yet implemented |
-| `stat` handler | `src/functions/stat/` | Header only | No `.cpp` file; topic structure not yet designed |
-| `tele` handler | `src/functions/tele/` | Header only | No `.cpp` file; sensors not yet connected |
+| `stat` handler | `src/functions/stat/` | Header only | No `.cpp` file; topic structure not yet designed; dispatch line in `mqttManager.cpp:63` is commented out, waiting for the handler |
+| `tele` handler | `src/functions/tele/` | Header only | No `.cpp` file; sensors not yet connected; dispatch line at `mqttManager.cpp:64` is commented out |
 | `conf` handler | `src/functions/conf/conf.cpp` | Empty stub | Function signature exists, body is empty |
-| Topic tokenisation + routing | `mqttManager.cpp:36–64` | Commented out | The entire topic tokenisation block AND every dispatch call (`cmnd`/`stat`/`tele`) are commented out. The active path inside `MQTT_EVENT_DATA` is `cmd(payload)` on line 66 — every incoming message is forwarded to the legacy debug handler with no device-ID filter |
-| `conf` wiring into router | `mqttManager.cpp` | Not added | `conf.h` not yet `#include`d; no `conf()` dispatch line — not even in the commented block |
-| Last Will (LWT) | `mqttManager.cpp:90–95` | Commented out | Pending final `stat/` topic structure |
-| `MQTT_EVENT_ERROR` detail | `mqttManager.cpp:71` | Minimal | Only prints event name — actual reason from `error_handle` not extracted |
-| MQTT init null check | `mqttManager.cpp:97` | Missing | `esp_mqtt_client_init()` return value not checked for NULL |
-| VLA stack allocation | `mqttManager.cpp:54` | Present | `payload` is a variable-length stack array — valid as a GCC extension but fragile. (The matching `topic` VLA at line 36 lives inside the commented routing block and will re-appear when that block is re-enabled.) Fixed-size buffers with explicit size checks would be safer |
+| `conf` wiring into router | `mqttManager.cpp` | Not added | `conf.h` not yet `#include`d in `mqttManager.cpp` and no `conf()` dispatch line — not even commented |
+| Per-channel cycle bookkeeping | `cmnd.cpp:7–10` | Single-slot only | `cycleFlag`/`cycleID`/`cycleStart`/`cycleInterval` are scalars — a second cycle command overwrites any in-flight cycle. Needs to become per-channel arrays if concurrent cycles are required |
+| Cycle payload validation | `cmnd.cpp:18` | Loose | `seg_len >= 5` permits a cycle topic with no payload-seconds; `atoi()` parse falls through to 0 → instant flicker. Tighten to `seg_len >= 5 && atoi(payload) > 0` or use JSON when payload schema firms up |
+| Last Will (LWT) | `mqttManager.cpp:96–101` | Commented out | Pending final `stat/` topic structure |
+| `MQTT_EVENT_ERROR` detail | `mqttManager.cpp:77–80` | Minimal | Prints event name and increments `globalErrorCounter` — actual reason from `error_handle` not extracted |
+| MQTT init null check | `mqttManager.cpp:103` | Missing | `esp_mqtt_client_init()` return value not checked for NULL |
+| VLA stack allocation | `mqttManager.cpp:39, 57` | Present | `topic` and `payload` are variable-length stack arrays — valid as a GCC extension but fragile under large MQTT payloads. Fixed-size buffers with explicit size checks would be safer |
 | WDT reset in WiFi loop | `initWiFiConnection.cpp:9` | Missing | The blocking connect loop does not call `esp_task_wdt_reset()` — safe now (10 s < 30 s WDT), but fragile if the timeout or attempt count is ever increased |
-| Global error counter | `config.cpp`, `main.cpp` | Commented out | `globalErrorCount` mechanism disabled during development |
-| Dynamic topic construction | `config.cpp:28` | Placeholder | `topic = "test"` must be replaced with a topic built from `username` at runtime |
+| `stat/` runtime topic | `mqttManager.cpp:20` | Placeholder | Boot "Online" announce still publishes to the dev `testTopic` (`"test"`) — must move to a `stat/<username>/online` topic once the `stat` namespace is designed |
 | Telemetry publishing | — | Not started | Nothing published to `stat/` or `tele/` yet; planned for the 60-second `loop()` interval |
 | Sensor support | — | Not started | `tele` is reserved for physical sensor data; pin mapping will need extending when sensors are added |
 | OTA firmware update | — | Not started | Updates currently require physical USB access; ESP32 OTA support via `cmnd` is the planned approach |

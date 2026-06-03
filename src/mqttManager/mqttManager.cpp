@@ -15,10 +15,13 @@ static void mqtt_event_handler(void* handler_args, esp_event_base_t base, int32_
   esp_mqtt_event_handle_t event = (esp_mqtt_event_handle_t) event_data;
 
   switch ((esp_mqtt_event_id_t) event_id) {
-    case MQTT_EVENT_CONNECTED:
+    case MQTT_EVENT_CONNECTED: {
       Serial.println("Connected to GridFlow EMQX Server");
-      esp_mqtt_client_enqueue(client, topic, "GF-KD1-Test --> Online", 0, 0, 0, true);
-      esp_mqtt_client_subscribe(client, topic, 2);
+      esp_mqtt_client_enqueue(client, testTopic, "GF-KD1-Test --> Online", 0, 0, 0, true);
+      String cmndTopic = "cmnd/" + username + "/#";
+      esp_mqtt_client_subscribe(client, cmndTopic.c_str(), 2);
+      globalErrorCounter = 0;
+      }
       break;
 
     case MQTT_EVENT_DISCONNECTED:
@@ -33,44 +36,47 @@ static void mqtt_event_handler(void* handler_args, esp_event_base_t base, int32_
       Serial.printf("Message Received in topic %.*s: ", event->topic_len, event->topic);
       Serial.printf("%.*s\n", event->data_len, event->data);
 
-      // char topic[event->topic_len +1];
-      // memcpy(topic, event->topic, event->topic_len);
-      // topic[event->topic_len] = '\0';
+      char topic[event->topic_len +1];
+      memcpy(topic, event->topic, event->topic_len);
+      topic[event->topic_len] = '\0';
 
-      // char *segment[MAX_SEGMENT];
-      // size_t tokenCount = 0;
-      // char *savePtr;
+      char *segment[MAX_SEGMENT];
+      size_t tokenCount = 0;
+      char *savePtr;
 
-      // char *token = strtok_r(topic, "/", &savePtr);
+      char *token = strtok_r(topic, "/", &savePtr);
 
-      // while(token != NULL && tokenCount < MAX_SEGMENT) {
-      //   segment[tokenCount] = token;
-      //   tokenCount++;
-      //   token = strtok_r(NULL, "/", &savePtr);
-      // }
+      while(token != NULL && tokenCount < MAX_SEGMENT) {
+        segment[tokenCount] = token;
+        tokenCount++;
+        token = strtok_r(NULL, "/", &savePtr);
+      }
 
-      // if (tokenCount < 3) return; 
+      if (tokenCount < 4) return; 
 
       char payload[event->data_len + 1];
       memcpy(payload, event->data, event->data_len);
       payload[event->data_len] = '\0';
 
-      // if(strcmp(segment[1], username.c_str()) == 0) {
-      //   // if(strcmp(segment[0], "cmnd") == 0) cmnd(segment, tokenCount, payload);
-      //   // if(strcmp(segment[0], "stat") == 0) stat(segment, tokenCount, payload);
-      //   // if(strcmp(segment[0], "tele") == 0) tele(segment, tokenCount, payload);
-      // } else {
-      //   Serial.println("Client ID Mismatch");
-      // }
-
+      if(strcmp(segment[1], username.c_str()) == 0) {
+        if(strcmp(segment[0], "cmnd") == 0) cmnd(segment, tokenCount, payload);
+        // if(strcmp(segment[0], "stat") == 0) stat(segment, tokenCount, payload);
+        // if(strcmp(segment[0], "tele") == 0) tele(segment, tokenCount, payload);
+      } else {
+        Serial.println("Client ID Mismatch");
+      }
+      
+      /* 
+      DEPRECIATED
       cmd(payload);
+      */
 
       break;
     }
 
     case MQTT_EVENT_ERROR:
       Serial.println("MQTT_EVENT_ERROR");
-      // globalErrorCount++;
+      globalErrorCounter++;
       break;
 
     default:

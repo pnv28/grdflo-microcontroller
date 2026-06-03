@@ -1,6 +1,8 @@
 #include "config.h"
 #include "esp32-hal-rgb-led.h"
 
+// DEPRECIATED
+
 // Note to people, for somereason the it is G R B instead of RGB so be careful
 
 void cmd(char *payload) {

@@ -25,17 +25,19 @@ const char* ca_cert = "-----BEGIN CERTIFICATE-----\n"
 // unsigned int globalErrorCount = 0;
 
 const char* brokerUri = "mqtts://emqx.internal.grdflo.com:8883";
-const char* topic = "test";
+const char* testTopic = "test";
 
 
 // Stuff which will be puleld from NVS
 String ssid;
 String wifiPassword;
+unsigned int globalErrorCounter = 0;
 String username;
 String password;
 u8_t pinOffset;
 u8_t totalPins;
 int *chargerPin, *lightPin;
+
 
 void getDeviceSpecificConfig() {
     Preferences prefs;

@@ -1,28 +1,25 @@
 #include "cmnd.h"
+#include <config.h>
 
-int charger(int chargerID, bool state);
 int light(int lightID, bool state);
-int cycle(unsigned int timeInSeconds);
+int cycle(unsigned int timeInSeconds, char *segment[]);
 
-/* 
-assuming max_seg is 6 [ 0 - 5 ]
-
-rough scratch board for self, while working, helps me visualize
-
-i know that segment[0] is command, I know that segment[1] is device id, both are being checkedin mqtt manager.
-
-So, segment[2] has to be either charger or light
-
-
-will implement cycle later
-
-*/
+int cycleID = 0;
+unsigned long cycleInterval = 0;
+unsigned long cycleStart = 0;
+bool cycleFlag = false;
 
 void cmnd(char *segment[], const size_t seg_len, const char *payload) {
 
     int status;
 
     if(strcmp(segment[2], "charger") == 0) {
+
+        if(seg_len >= 5 && strcmp(segment[4], "cycle") == 0) {
+            cycle(atoi(payload), segment);
+            return;
+        }
+
         status = charger(atoi(segment[3]), atoi(payload));
     }
     if(strcmp(segment[2], "light") == 0) {
@@ -40,8 +37,10 @@ int charger(int chargerID, bool state) {
 
     if(state) {
         digitalWrite(chargerPin[chargerID], HIGH);
+        Serial.printf("Charger %d (GPIO %d) -> ON\n", chargerID, chargerPin[chargerID]);
     } else if(!state) {
         digitalWrite(chargerPin[chargerID], LOW);
+        Serial.printf("Charger %d (GPIO %d) -> OFF\n", chargerID, chargerPin[chargerID]);
     }
 
     return 0;
@@ -56,9 +55,22 @@ int light(int lightID, bool state) {
 
     if(state) {
         digitalWrite(lightPin[lightID], HIGH);
+        Serial.printf("Light %d (GPIO %d) -> ON\n", lightID, lightPin[lightID]);
     } else if(!state) {
         digitalWrite(lightPin[lightID], LOW);
+        Serial.printf("Light %d (GPIO %d) -> OFF\n", lightID, lightPin[lightID]);
     }
+
+    return 0;
+}
+
+int cycle(unsigned int timeInSeconds, char *segment[]) {
+    cycleFlag = true;
+    charger(atoi(segment[3]), false);
+    cycleID = atoi(segment[3]);
+    cycleInterval = timeInSeconds*1000;
+    cycleStart = millis();
+    Serial.printf("Cycle started: charger %d, interval %lu ms\n", cycleID, cycleInterval);
 
     return 0;
 }
