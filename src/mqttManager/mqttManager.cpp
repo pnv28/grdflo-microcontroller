@@ -1,5 +1,5 @@
 #include "config.h"
-#include "cmd.h"
+// #include "cmd.h" DEPRECIATED
 #include "mqttManager.h"
 #include "mqtt_client.h"
 
