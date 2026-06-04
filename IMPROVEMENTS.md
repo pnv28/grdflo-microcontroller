@@ -11,57 +11,25 @@
 
 ### 1. `segment[1]` is accessed without checking if it exists
 
-> **Currently dormant — guard is in place in the staged code.** The whole tokenisation + dispatch block is commented out today, and the staged version (still inside that comment block) already contains `if (tokenCount < 3) return;` directly before any `segment[1]` access. So when the block is uncommented, this bug will not re-appear. Item left in the doc as a reminder: **do not delete that guard line** when re-enabling routing.
+> fixed
 
-**File:** `src/mqttManager/mqttManager.cpp`, line 58 (inside the commented block)
+**File:** `src/mqttManager/mqttManager.cpp`
 
 **The original problem:**
 
-After tokenising the topic, the code accessed `segment[1]` directly:
+After tokenising the topic, the code accessed `segment[1]` directly with no check that `tokenCount >= 2` first. A topic with only one level (e.g., `"test"` — the boot-announce topic the device was subscribed to) would make `segment[1]` an uninitialised pointer — undefined behaviour, likely a crash.
 
-```cpp
-if(strcmp(segment[1], username.c_str()) == 0) {
-```
-
-With no check that `tokenCount >= 2` before doing this, a topic with only one level (e.g., `"test"` — which is **exactly the topic the device is currently subscribed to**) would make `segment[1]` an uninitialised pointer, and reading it would be undefined behaviour — most likely a crash.
-
-**The fix (already present in the staged code):**
-
-```cpp
-if (tokenCount < 3) return;   // ← guards segment[1] AND segment[2] before any access
-if(strcmp(segment[1], username.c_str()) == 0) { ...
-```
-
-The guard uses `< 3` rather than `< 2` because the dispatch path also touches `segment[2]` (the sub-topic), so requiring three segments up front covers both reads in one check.
+**Resolution:** The routing block is now live with `if (tokenCount < 3) return;` as the first check in `MQTT_EVENT_DATA`, executed before any `segment[]` access. The `< 3` threshold guards both `segment[1]` (device ID) and `segment[2]` (sub-topic) in one check.
 
 ---
 
 ### 2. `topic` variable shadows the global
 
-> **Currently dormant but NOT yet fixed.** The offending line is inside the commented-out tokenisation block, so it has no runtime effect today. However, the staged code still uses `char topic[...]` — the rename to `topicBuf` (or similar) was never applied. When the block is uncommented this shadow comes back.
+> **Non-issue — moot.** This was filed against a global `const char* topic`, but the variable in `config.h` / `config.cpp` was always named `testTopic`, not `topic`. There is no global named `topic` for the local `char topic[...]` in `MQTT_EVENT_DATA` to shadow. The item is kept for historical reference.
 
-**File:** `src/mqttManager/mqttManager.cpp`, line 36 (inside the commented block)
+**File:** `src/mqttManager/mqttManager.cpp`
 
-**The problem:**
-
-Inside `MQTT_EVENT_DATA`:
-
-```cpp
-char topic[event->topic_len + 1];   // ← local variable named "topic"
-```
-
-This shadows the global `const char* topic` from `config.h`. The global is still correctly used in `MQTT_EVENT_CONNECTED` (lines 20–21), but inside `MQTT_EVENT_DATA`, any reference to `topic` would mean the local char array, not the global pointer. It is confusing and will cause a subtle bug once the real subscription topic is built at runtime from `username` and the routing block is re-enabled.
-
-**The fix (apply when uncommenting the routing block):**
-
-Rename the local variable:
-
-```cpp
-char topicBuf[event->topic_len + 1];
-memcpy(topicBuf, event->topic, event->topic_len);
-topicBuf[event->topic_len] = '\0';
-// and then strtok_r on topicBuf
-```
+**Original concern:** The local `char topic[event->topic_len + 1]` inside `MQTT_EVENT_DATA` was believed to shadow a global `const char* topic`. The routing block is now live and the local variable is active. In practice there is no shadowing because the only related global in `config.h` is `testTopic`, a different name entirely. No rename to `topicBuf` is needed.
 
 ---
 
@@ -96,7 +64,7 @@ if (client == NULL) {
 
 > fixed
 
-**File:** `lib/wifiUtils/src/initWiFiConnection.cpp`, lines 4–6
+**File:** `src/wifiUtils/initWiFiConnection.cpp`, lines 4–6
 
 **The problem:**
 
@@ -120,6 +88,8 @@ WiFi.begin(ssid, password);
 
 ### 4a. `MQTT_EVENT_DATA` forwards every message to `cmd()` with no device-ID filter
 
+> fixed
+
 **File:** `src/mqttManager/mqttManager.cpp`, line 66
 
 **The problem:**
@@ -137,6 +107,8 @@ That is acceptable for bench work, but the moment this firmware sees a shared pr
 **The fix:**
 
 Re-enable the structured routing block above the `cmd(payload)` call (and apply item #2 when you do — rename the local `topic` to `topicBuf`). Once routing is live, the `cmd(payload)` line should be removed entirely or gated behind a debug-only subtopic — it predates the structured router and is not part of the production message flow.
+
+**Resolution:** The structured tokenisation + dispatch block is now live in `MQTT_EVENT_DATA`. Topics are tokenised on `/`, `segment[1]` is verified against `username` (or the literal `"all"` for broadcast), and dispatch runs on `segment[0]` — `cmnd → cmnd()` and `conf → conf()`. The legacy `cmd(payload)` call site is wrapped in a `/* DEPRECIATED */` block and no longer reached.
 
 ---
 
@@ -285,23 +257,21 @@ void getDeviceSpecificConfig() {
 
 ### 11. VLA (Variable Length Array) stack allocation for topic and payload
 
-**File:** `src/mqttManager/mqttManager.cpp`, line 54 (payload — active), line 36 (topic — inside the commented routing block)
+**File:** `src/mqttManager/mqttManager.cpp`, lines 46 and 64 (both now active)
 
 **The problem:**
 
 ```cpp
-char topic[event->topic_len + 1];    // size known only at runtime — currently commented out
-char payload[event->data_len + 1];   // size known only at runtime — currently active
+char topic[event->topic_len + 1];    // size known only at runtime — ACTIVE
+char payload[event->data_len + 1];   // size known only at runtime — ACTIVE
 ```
 
-VLAs are allocated on the **stack** at runtime. In standard C++ they are not even legal (GCC allows them as an extension). On embedded systems, the stack is small. The ESP-IDF MQTT client caps incoming message size at the buffer size (default 1024 bytes), so in practice you won't overflow — but it is fragile because:
+Both VLAs are now live (the routing block is uncommented). VLAs are allocated on the **stack** at runtime. In standard C++ they are not legal (GCC allows them as an extension). On embedded systems, the stack is small. The ESP-IDF MQTT client caps incoming message size at the buffer size (default 1024 bytes), so in practice you won't overflow — but it is fragile because:
 
 - It relies on an implicit cap you don't control from this code.
 - If that cap is ever changed, you get a silent stack overflow.
 
-Only the `payload` VLA is live today. The `topic` VLA will become live again the moment the routing block is uncommented.
-
-**The fix:** Use fixed-size buffers with an explicit size check (apply to `payload` now; apply to `topic`/`topicBuf` when re-enabling routing — see item #2):
+**The fix:** Use fixed-size buffers with an explicit size check:
 
 ```cpp
 const size_t MAX_TOPIC_LEN = 256;
@@ -343,7 +313,7 @@ if (wdt_err != ESP_OK) {
 
 ### 13. The `initWiFiConnection` blocking loop doesn't reset the WDT
 
-**File:** `lib/wifiUtils/src/initWiFiConnection.cpp`, lines 9–13
+**File:** `src/wifiUtils/initWiFiConnection.cpp`, lines 9–13
 
 **The problem:**
 
@@ -390,15 +360,21 @@ Not urgent during development, but something to plan for before devices go to cu
 
 ---
 
-### 16. The `topic` global will need to become dynamic
+### 16. Boot-time online announce still uses a hardcoded topic and label
 
-Currently:
+**Partially resolved.** The per-device subscriptions (`cmnd/<username>/#`, `conf/<username>/#`) are already built dynamically from `username` in `MQTT_EVENT_CONNECTED` — that part is done. What remains:
 
 ```cpp
-const char* topic = "test";
+// config.cpp
+const char* testTopic = "test";   // ← still hardcoded
+
+// mqttManager.cpp MQTT_EVENT_CONNECTED
+esp_mqtt_client_enqueue(client, testTopic, "GF-KD1-Test --> Online", ...);
 ```
 
-The real design subscribes to `cmnd/<device_id>/#` and publishes to `stat/<device_id>/...`. The topic needs to be constructed at runtime from `username` (which comes from NVS and isn't known at compile time). The current hardcoded `topic` is a dev placeholder — remember to replace it when you wire up the real subscription in `MQTT_EVENT_CONNECTED`.
+Two things still need updating:
+1. The online announce topic (`testTopic = "test"`) should become `stat/<username>/online` to match the `stat/` namespace and pair with the future LWT.
+2. The announce payload (`"GF-KD1-Test --> Online"`) is a hardcoded label — it should use `username` from NVS so every device identifies itself correctly to the broker.
 
 ---
 
@@ -410,11 +386,20 @@ The `tele` namespace is planned but nothing is published yet. A basic telemetry 
 
 ### 18. `MQTT_EVENT_ERROR` could re-enable the error counter
 
-The `globalErrorCount` mechanism (currently commented out everywhere) was a good idea. Combined with proper error logging from item #5 above, you could re-enable it: increment on `MQTT_EVENT_ERROR`, reset on `MQTT_EVENT_CONNECTED`, and reboot if it exceeds a threshold. This makes the device self-healing in the field when the broker has transient issues.
+> fixed
+
+The `globalErrorCounter` mechanism is now fully active:
+- Incremented in `MQTT_EVENT_ERROR`
+- Reset to `0` in `MQTT_EVENT_CONNECTED`
+- Checked in `loop()`: `if(globalErrorCounter >= 5) ESP.restart()`
+
+Combined with proper error logging from item #5 above, the device will now self-heal after 5 unrecovered MQTT errors between 60-second heartbeats.
 
 ---
 
 ### 19. `cmnd()` accesses `segment[3]` without checking `seg_len >= 4`
+
+> fixed
 
 **File:** `src/functions/cmnd/cmnd.cpp`, lines 25–30
 
@@ -440,6 +425,8 @@ void cmnd(char *segment[], const size_t seg_len, const char *payload) {
 ```
 
 The upstream-guard approach is cleaner because the channel index is part of the contract for all three root namespaces.
+
+**Resolution:** A local `if (seg_len < 4) return;` guard is now at the top of `cmnd()`. The upstream guard in `mqttManager.cpp` had to stay at `< 3` so 3-segment `conf/<dev>/health` etc. can reach the conf handler — so the `< 4` check lives inside `cmnd()` itself.
 
 ---
 
@@ -534,6 +521,8 @@ case MQTT_EVENT_DATA: {
 
 ### 23. `cmnd.cpp` uses a chain of `if` instead of `else if`
 
+> fixed
+
 **File:** `src/functions/cmnd/cmnd.cpp`, lines 25–30
 
 Same issue as item #8 in `cmd.cpp`. `charger` and `light` are mutually exclusive — once one matches, the other should not be evaluated. Use `else if`:
@@ -543,9 +532,13 @@ if(strcmp(segment[2], "charger") == 0)      { ... }
 else if(strcmp(segment[2], "light") == 0)   { ... }
 ```
 
+**Resolution:** The `charger` and `light` branches in `cmnd()` are now chained with `else if`. An unrecognised `segment[2]` falls into a default `else { return; }` that exits **without** acking — consistent with the rule of not confirming a topic the firmware silently dropped.
+
 ---
 
 ### 24. `cmnd()` assigns to `status` but never uses or reports it
+
+> fixed
 
 **File:** `src/functions/cmnd/cmnd.cpp`, lines 23–30
 
@@ -563,6 +556,8 @@ if(strcmp(segment[2], "light") == 0) {
 `charger()` and `light()` return `-1` on out-of-range input and `0` on success. The caller throws that away, so an out-of-range relay command fails silently — the operator on the other end of the broker has no way to know their command was rejected.
 
 When the `stat` namespace is wired up, `cmnd()` should publish the result to `stat/<id>/<group>/<channel>` so the operator gets confirmation. Either that, or remove `status` entirely if you genuinely don't care.
+
+**Resolution:** `status` is now initialised to `-1`, set by whichever sub-handler runs (`charger()` / `light()` / `cycle()`), and passed into `statAck(segment, seg_len, status == 0)` at the end of `cmnd()`. The operator now gets a `stat/<dev>/ack` with `"ok": true|false` for every actioned command. (For the `light/all` broadcast form, `status` stays at `-1` if any single channel fails so the ack reports `ok: false`.)
 
 ---
 
@@ -678,6 +673,8 @@ configTime(0, 0, "pool.ntp.org", "time.google.com");
 
 ### 31. `cycle()` is forward-declared but never implemented or called
 
+> fixed
+
 **File:** `src/functions/cmnd/cmnd.cpp`, line 5
 
 ```cpp
@@ -686,9 +683,13 @@ int cycle(unsigned int timeInSeconds);
 
 Declared at file scope, no definition, no call site. It's a TODO stub that should either be implemented or removed. Dead forward declarations confuse future readers (and tools like clangd will flag them).
 
+**Resolution:** `cycle()` is fully implemented. Signature is now `int cycle(unsigned int timeInSeconds, char *segment[])`. It parses `chargerID` from `segment[3]`, calls `charger(chargerID, false)` (returning early if that returns non-zero), then arms the `cycleFlag` / `cycleID` / `cycleStart` / `cycleInterval` globals (with `cycleInterval = timeInSeconds * 1000`). The re-enable is owned by `loop()` in `main.cpp`, which watches the timestamp and calls `charger(cycleID, true)` when it fires. Single-slot bookkeeping limitation is still tracked separately — see the cycle entries in `DOCUMENTATION.md` Section 15.
+
 ---
 
 ### 32. `mqttManager.cpp` includes `ArduinoJson.h` but never uses it
+
+> fixed
 
 **File:** `src/mqttManager/mqttManager.cpp`, line 5
 
@@ -697,6 +698,8 @@ Declared at file scope, no definition, no call site. It's a TODO stub that shoul
 ```
 
 No `JsonDocument`, no `serializeJson`, no `deserializeJson` calls anywhere in this file. Drop the include until JSON handling actually moves into this file. (Once `stat`/`tele` start producing JSON payloads, the include will belong wherever they're built — not necessarily here.)
+
+**Resolution:** The `bblanchon/ArduinoJson@7.4.2` `lib_deps` entry has been removed entirely from both `platformio.ini` environments, and the include has been dropped. The `stat/` payloads are small fixed-shape JSON strings built directly with `snprintf`, so a full JSON library is not needed today.
 
 ---
 
@@ -778,7 +781,7 @@ extern u8_t totalPins;
 
 ### 37. `checkWiFiStatus()` does `disconnect()` + `begin()` instead of `WiFi.reconnect()`
 
-**File:** `lib/wifiUtils/src/checkWiFiStatus.cpp`, lines 5–8
+**File:** `src/wifiUtils/checkWiFiStatus.cpp`, lines 5–8
 
 ```cpp
 if (WiFi.status() != WL_CONNECTED) {
@@ -839,7 +842,7 @@ Currently safe because both are set once in `setup()` and never touched again, b
 
 ### 40. Consider `WiFi.setSleep(false)` for control-path responsiveness
 
-**File:** `lib/wifiUtils/src/initWiFiConnection.cpp`
+**File:** `src/wifiUtils/initWiFiConnection.cpp`
 
 The ESP32 WiFi modem enters power-save mode by default, which adds ~100ms of latency to incoming packets (the modem wakes up on the next beacon). For a relay-control device where an operator presses a button and expects the relay to click, that latency is noticeable.
 
@@ -859,39 +862,39 @@ Once the `cmnd` handler is live, consider a minimum interval between toggles for
 
 | # | Issue | File | Severity |
 |---|-------|------|----------|
-| 1 | `segment[1]` out-of-bounds access | `mqttManager.cpp:58` (commented block) | Dormant — guard `tokenCount < 3` already present in staged code |
-| 2 | `topic` variable shadowing | `mqttManager.cpp:36` (commented block) | Dormant but **not yet fixed** — re-appears when routing is uncommented |
+| 1 | `segment[1]` out-of-bounds access | `mqttManager.cpp` | ~~Dormant — guard in staged code~~ **fixed** |
+| 2 | `topic` variable shadowing | `mqttManager.cpp` | ~~Dormant but not yet fixed~~ **moot** — global is `testTopic` not `topic`, no shadowing |
 | 3 | MQTT init return value not checked | `mqttManager.cpp:97` | **Fix now** |
 | 4 | `WiFi.persistent` called after `WiFi.begin` | `initWiFiConnection.cpp:4` | ~~**Fix now**~~ **fixed** |
-| 4a | `MQTT_EVENT_DATA` forwards every message to `cmd()` (no device-ID filter) | `mqttManager.cpp:66` | **Fix now** (re-enable structured routing) |
+| 4a | `MQTT_EVENT_DATA` forwards every message to `cmd()` (no device-ID filter) | `mqttManager.cpp:66` | ~~**Fix now** (re-enable structured routing)~~ **fixed** |
 | 5 | MQTT errors log nothing useful | `mqttManager.cpp:71` | Before deployment |
 | 6 | `lightPin/chargerPin` declared but not defined | `config.h:28–29` | ~~Before deployment~~ **fixed** |
 | 7 | `LED_PIN` not in `config.h` | `cmd.cpp:3` | ~~Before deployment~~ **fixed** |
 | 8 | `if` chain should be `else if` | `cmd.cpp:7–42` | Before deployment |
 | 9 | Missing `\n` in heap print | `main.cpp:42` | Before deployment |
 | 10 | `Preferences` should be a local variable | `config.cpp:41` | ~~Before deployment~~ **fixed** |
-| 11 | VLA stack allocation | `mqttManager.cpp:54` (payload, active); line 36 (topic, in commented block) | Good habit |
+| 11 | VLA stack allocation | `mqttManager.cpp:46` (topic) and `:64` (payload) — **both now active** | Good habit |
 | 12 | WDT add return value unchecked | `main.cpp:26` | Good habit |
 | 13 | Blocking WiFi loop doesn't reset WDT | `initWiFiConnection.cpp:9` | Good habit |
 | 14 | No OTA update mechanism | — | Future |
 | 15 | NVS not encrypted | — | Future |
-| 16 | `topic` global needs to become dynamic | `config.cpp:28` | Future |
+| 16 | Boot announce still uses hardcoded topic + label | `mqttManager.cpp:22` (announce), `config.cpp` (`testTopic`) | Partially done — subscriptions are dynamic; announce topic/payload still hardcoded |
 | 17 | No telemetry publishing | — | Future |
-| 18 | Error counter not re-enabled | — | Future |
-| 19 | `cmnd()` accesses `segment[3]` without `seg_len >= 4` check | `cmnd.cpp:25` | **Fix now** |
+| 18 | Error counter not re-enabled | — | ~~Future~~ **fixed** |
+| 19 | `cmnd()` accesses `segment[3]` without `seg_len >= 4` check | `cmnd.cpp:25` | ~~**Fix now**~~ **fixed** |
 | 20 | `charger()` / `light()` don't reject negative channel IDs | `cmnd.cpp:34,50` | **Fix now** |
 | 21 | `atoi(payload)` won't parse `"on"`/`"off"`/`"true"`/`"false"` | `cmnd.cpp:26,29` | **Fix now** (define payload contract) |
 | 22 | `MQTT_EVENT_DATA` doesn't handle fragmented messages | `mqttManager.cpp:32` | **Fix now** |
-| 23 | `cmnd.cpp` chained `if` should be `else if` | `cmnd.cpp:25–30` | Before deployment |
-| 24 | `status` assigned but never reported back | `cmnd.cpp:23–30` | Before deployment |
+| 23 | `cmnd.cpp` chained `if` should be `else if` | `cmnd.cpp:25–30` | ~~Before deployment~~ **fixed** |
+| 24 | `status` assigned but never reported back | `cmnd.cpp:23–30` | ~~Before deployment~~ **fixed** |
 | 25 | `mqttPublish()` discards `esp_mqtt_client_enqueue()` return | `mqttManager.cpp:107` | Before deployment |
 | 26 | Hardcoded `"GF-KD1-Test --> Online"` published to literal `"test"` | `mqttManager.cpp:20–21` | Before deployment |
 | 27 | Subscribe QoS 2 vs publish QoS 0 inconsistency | `mqttManager.cpp:20–21` | Before deployment |
 | 28 | `ca_cert` and `brokerUri` hardcoded in firmware | `config.cpp:4–27` | Before deployment |
 | 29 | Last Will Testament is commented out | `mqttManager.cpp:90–95` | Before deployment |
 | 30 | No NTP / time sync before TLS handshake | `main.cpp` | Before deployment |
-| 31 | `cycle()` forward-declared but never implemented | `cmnd.cpp:5` | Good habit |
-| 32 | `ArduinoJson.h` included but unused | `mqttManager.cpp:5` | Good habit |
+| 31 | `cycle()` forward-declared but never implemented | `cmnd.cpp:5` | ~~Good habit~~ **fixed** |
+| 32 | `ArduinoJson.h` included but unused | `mqttManager.cpp:5` | ~~Good habit~~ **fixed** |
 | 33 | `else if(!state)` is redundant (bool only has 2 values) | `cmnd.cpp:41–45,57–61` | Good habit |
 | 34 | `for(counter; ...)` empty initializer statement | `config.cpp:91` | Good habit |
 | 35 | Magic `65` instead of `'A'` in NVS key generation | `config.cpp:74,91` | Good habit |

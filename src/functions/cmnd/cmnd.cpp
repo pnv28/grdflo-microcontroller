@@ -22,7 +22,15 @@ void cmnd(char *segment[], const size_t seg_len, const char *payload) {
             status = charger(atoi(segment[3]), atoi(payload));
         }
     } else if(strcmp(segment[2], "light") == 0) {
-        status = light(atoi(segment[3]), atoi(payload));
+        if(strcmp(segment[3], "all") == 0) {
+            status = 0;
+            for(int i = 0; i < (totalPins-pinOffset); i++) {
+                int tempStatus = light(i, atoi(payload));
+                if(tempStatus != 0) status = -1;
+            }
+        } else {
+            status = light(atoi(segment[3]), atoi(payload));
+        }
     } else {
         return; // unrecognised group — don't ack a topic we ignored
     }

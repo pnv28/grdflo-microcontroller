@@ -24,6 +24,7 @@ static void mqtt_event_handler(void* handler_args, esp_event_base_t base, int32_
       esp_mqtt_client_subscribe(client, cmndTopic.c_str(), 2);
       String confTopic = "conf/" + username + "/#";
       esp_mqtt_client_subscribe(client, confTopic.c_str(), 2);
+      esp_mqtt_client_subscribe(client, "cmnd/all/#", 2);
       globalErrorCounter = 0;
       statusHandler(STATE_ALL_IS_WELL);
       }
@@ -64,7 +65,7 @@ static void mqtt_event_handler(void* handler_args, esp_event_base_t base, int32_
       memcpy(payload, event->data, event->data_len);
       payload[event->data_len] = '\0';
 
-      if(strcmp(segment[1], username.c_str()) == 0) {
+      if(strcmp(segment[1], username.c_str()) == 0 || strcmp(segment[1], "all") == 0) {
         if(strcmp(segment[0], "cmnd") == 0) cmnd(segment, tokenCount, payload);
         if(strcmp(segment[0], "conf") == 0) conf(segment, tokenCount, payload);
         // stat/ and tele/ are publish-only namespaces — device → cloud only

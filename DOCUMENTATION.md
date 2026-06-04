@@ -1,8 +1,8 @@
 # GridFlow Microcontroller Firmware — Documentation
 
-> **Status: Functional, with `tele` and a few hardening items outstanding.** The WiFi + TLS-MQTT infrastructure is live, the structured `MQTT_EVENT_DATA` router is active, and the `cmnd`, `conf`, and `stat` namespaces are all wired in. `cmnd` covers `charger`, `light`, and `cycle`; `conf` covers `health`, `state`, `reboot`, and `edit` (currently only the `creds` NVS namespace is writable); `stat` is publish-only and exposes `statHealth()` / `statState()` / `statAck()`. Periodic `statHealth()` runs from the 60 s `loop()` heartbeat; every actioned `cmnd` and every `conf/edit` publishes a `stat/<dev>/ack`. Outstanding: `tele` is still a header-only stub (no sensors connected), automatic `statState()` on relay change is not wired, and several smaller items are listed in [Section 15](#15-what-is-not-yet-implemented).
+> **Status: Functional, with `tele` and a few hardening items outstanding.** The WiFi + TLS-MQTT infrastructure is live, the structured `MQTT_EVENT_DATA` router is active, and the `cmnd`, `conf`, and `stat` namespaces are all wired in. `cmnd` covers `charger`, `light` (including the `light/all` broadcast form), and `cycle` (now fully implemented); `conf` is live and covers `health`, `state`, `reboot`, and `edit` (currently only the `creds` NVS namespace is writable); `stat` is publish-only and exposes `statHealth()` / `statState()` / `statAck()`. A new `cmnd/all/#` broadcast subscription means commands addressed to the literal device ID `all` are accepted by every device. Periodic `statHealth()` runs from the 60 s `loop()` heartbeat; every actioned `cmnd` and every `conf/edit` publishes a `stat/<dev>/ack`. Outstanding: `tele` is still a header-only stub (no sensors connected), automatic `statState()` on relay change is not wired, and several smaller items are listed in [Section 15](#15-what-is-not-yet-implemented).
 >
-> **Current dev-time behaviour:** Inside `MQTT_EVENT_DATA` the topic is tokenised on `/` into `segment[]` (guard `tokenCount < 3`), the device-ID is verified against `username`, and dispatch runs on `segment[0]` — `cmnd → cmnd()` and `conf → conf()`. The broker subscriptions established in `MQTT_EVENT_CONNECTED` are `cmnd/<username>/#` and `conf/<username>/#`, both at QoS 2. The legacy `cmd(payload)` debug handler in `src/cmd.cpp` is no longer reached — the call site inside `MQTT_EVENT_DATA` is wrapped in a `/* … */` block and retained only as a marker that the path was deliberately retired.
+> **Current dev-time behaviour:** Inside `MQTT_EVENT_DATA` the topic is tokenised on `/` into `segment[]` (guard `tokenCount < 3`), the device-ID is verified against `username` **or the literal `"all"`** (broadcast addressing), and dispatch runs on `segment[0]` — `cmnd → cmnd()` and `conf → conf()`. The broker subscriptions established in `MQTT_EVENT_CONNECTED` are `cmnd/<username>/#`, `conf/<username>/#`, and `cmnd/all/#`, all at QoS 2. The legacy `cmd(payload)` debug handler in `src/cmd.cpp` is no longer reached — the call site inside `MQTT_EVENT_DATA` is wrapped in a `/* DEPRECIATED */` block and retained only as a marker that the path was deliberately retired.
 
 ---
 
@@ -14,7 +14,7 @@
 4. [Build Configuration — `platformio.ini`](#4-build-configuration--platformioini)
 5. [Global Configuration — `config.h` / `config.cpp`](#5-global-configuration--configh--configcpp)
 6. [Entry Point — `main.cpp`](#6-entry-point--maincpp)
-7. [WiFi Utilities — `lib/wifiUtils/`](#7-wifi-utilities--libwifiutils)
+7. [WiFi Utilities — `src/wifiUtils/`](#7-wifi-utilities--srcwifiutils)
 8. [MQTT Manager — `src/mqttManager/`](#8-mqtt-manager--srcmqttmanager)
 9. [Topic Routing — `src/functions/`](#9-topic-routing--srcfunctions)
 10. [Status LED — `src/statusManager/`](#10-status-led--srcstatusmanager)
@@ -74,6 +74,13 @@ The device drives a relay module for controlling charging and lighting circuits.
 
 The total number of channels physically connected to GPIO (`totalPins`), the charger/light split (`pinOffset`), and the actual GPIO number for each channel are not hardcoded anywhere in the firmware. They are stored in NVS and loaded at boot. This means the supervisor's requirement — that pin count and pin assignments must be configurable without touching the firmware — is fully met. See [Section 5](#5-global-configuration--configh--configcpp) for the complete design.
 
+> **Relay contact logic — important.** The relay module on this device is wired such that:
+>
+> - **GPIO `HIGH` → relay coil de-energised → NC (Normally Closed) contact is connected.**
+> - **GPIO `LOW`  → relay coil energised   → NO (Normally Open) contact is connected.**
+>
+> Every `digitalWrite()` in `charger()` and `light()`, and the boot-time `digitalWrite(chargerPin[i], HIGH)` in `config.cpp`, should be read with that mapping in mind. The firmware never talks about "energised/closed" in the abstract — it drives a GPIO level and the contact (NC vs NO) follows from the wiring above. The charger boot state of HIGH therefore parks the relays on their **NC** contact with the coil **de-energised** (see [Section 5, Step 5](#step-5--pin-mapping-pinmapping-namespace)).
+
 ---
 
 ## 3. Project Structure
@@ -125,7 +132,7 @@ grdflo-microcontroller/
 
 ## 4. Build Configuration — `platformio.ini`
 
-Two environments are defined — one per supported board. Activate the one you need by ensuring it is uncommented; comment out the other. Currently the **C3 is active and the WROVER is commented out**, reflecting active development on the C3.
+Two environments are defined — one per supported board. Both are currently uncommented and active. Active development is on the **C3-DevKitM-1**; the WROVER environment is present and compiles but has no additional hardware wired.
 
 **ESP32-C3-DevKitM-1 environment (current dev board):**
 ```ini
@@ -135,7 +142,6 @@ board = esp32-c3-devkitm-1
 framework = arduino
 monitor_speed = 115200
 board_build.partitions = min_spiffs.csv
-lib_deps = bblanchon/ArduinoJson@7.4.2
 build_flags =
     -DARDUINO_USB_CDC_ON_BOOT=1
     -DARDUINO_USB_MODE=1
@@ -148,10 +154,11 @@ platform = https://github.com/pioarduino/platform-espressif32/releases/download/
 board = esp32dev
 framework = arduino
 monitor_speed = 115200
-lib_deps = bblanchon/ArduinoJson@7.4.2
 board_build.partitions = min_spiffs.csv
 build_flags = -DBOARD_HAS_PSRAM
 ```
+
+Neither environment currently pulls in any third-party `lib_deps` — the firmware uses only Arduino + ESP-IDF APIs. The previous `bblanchon/ArduinoJson@7.4.2` pin was removed entirely from both environments once it became clear the `stat/` payloads are small fixed-shape JSON strings built directly with `snprintf` (see [Section 9](#statstatcpp)), so a full JSON library is not warranted today.
 
 ### Key points
 
@@ -163,7 +170,6 @@ Settings common to both environments:
 | `framework = arduino` | Uses the Arduino-on-ESP-IDF layer. You can call standard `Arduino.h` functions AND drop into raw ESP-IDF APIs (like `esp_mqtt_client_*`, `esp_task_wdt_*`). |
 | `monitor_speed = 115200` | Serial monitor baud rate — must match `Serial.begin(115200)` in `main.cpp`. |
 | `board_build.partitions = min_spiffs.csv` | Partition table that allocates minimal space for SPIFFS, giving the application partition more flash. No filesystem is used here — all configuration lives in NVS. |
-| `lib_deps = bblanchon/ArduinoJson@7.4.2` | Pins ArduinoJson to version 7.4.2. Included in `mqttManager.cpp` but not yet actively used — ready for JSON payload parsing in the handlers once implemented. |
 
 Settings that differ between boards:
 
@@ -224,7 +230,9 @@ extern bool cycleFlag;                 // true while a cycle is in flight
 
 **Why pointers for `chargerPin`, `lightPin`, and `relayState`?** The size of these arrays is only known at boot time after reading `totalPins` and `pinOffset` from NVS. A fixed-size declaration like `int chargerPin[16]` would always allocate 16 integers regardless of how many relay channels are actually connected — wasting memory. Dynamic allocation with `new int[pinOffset]`, `new int[totalPins - pinOffset]`, and `new int[totalPins]()` sizes them to exactly what this particular deployment needs.
 
-**`relayState` layout.** `relayState[0 .. pinOffset-1]` mirrors the chargers (same index as the channel ID in `cmnd/<dev>/charger/<i>`). `relayState[pinOffset .. totalPins-1]` mirrors the lights (with a `pinOffset` offset to translate `lightID` → mirror index). The allocation uses `new int[totalPins]()` — the trailing `()` value-initialises every element to 0, so all relays start as OFF in the mirror at boot. Writes happen inside `charger()` and `light()` immediately after each `digitalWrite`, so the mirror cannot drift out of sync with the actual GPIO levels (assuming no external code drives those pins). `statState()` reads from this mirror, so it does not need to call `digitalRead` 16 times to publish the snapshot.
+**`relayState` layout.** `relayState[0 .. pinOffset-1]` mirrors the chargers (same index as the channel ID in `cmnd/<dev>/charger/<i>`). `relayState[pinOffset .. totalPins-1]` mirrors the lights (with a `pinOffset` offset to translate `lightID` → mirror index). The allocation uses `new int[totalPins]()` — the trailing `()` value-initialises every element to 0. Writes happen inside `charger()` and `light()` immediately after each `digitalWrite`, so during normal operation the mirror stays in sync with the actual GPIO levels. `statState()` reads from this mirror, so it does not need to call `digitalRead` 16 times to publish the snapshot.
+
+> **Boot-state mismatch.** `relayState` is zeroed at allocation, but charger GPIOs are immediately driven `HIGH` inside the pin-mapping loop (see Step 5). `relayState` is NOT updated during that `digitalWrite` — only `charger()` and `light()` write to it. This means between boot and the first `cmnd` that processes a charger, `relayState[0..pinOffset-1]` reports `0` (LOW) while the physical GPIOs are actually `HIGH` (NC contact). A `conf/<dev>/state` request arriving before any `cmnd` will therefore return inaccurate charger state in the snapshot.
 
 ### `config.cpp` — Definitions and NVS Loading
 
@@ -331,11 +339,14 @@ prefs.end();
 if(ssid.compareTo("readError") == 0 || wifiPassword.compareTo("readError") == 0 ||
    username.compareTo("readError") == 0 || password.compareTo("readError") == 0 ||
    totalPins > 16 || pinOffset > totalPins) {
+    statusHandler(STATE_ERROR);
     Serial.println("Could not get appropriate read value from NVS...");
-    delay(100);
+    delay(5000);
     ESP.restart();
 }
 ```
+
+The 5-second delay before `ESP.restart()` gives the operator time to read the failure message and see the LED turn solid red before the reboot loop continues — invaluable for diagnosing a misprovisioned device from the serial monitor.
 
 - Any credential string still equal to `"readError"` means the key was missing from NVS.
 - `totalPins > 16` catches both the `255` not-found sentinel and any physically impossible value (the relay module only has 16 channels). Since `255 > 16` is true, a missing `totalPin` key always triggers a reboot — no separate sentinel check needed.
@@ -369,6 +380,7 @@ for(counter = 65; counter < (65 + pinOffset); counter++) {
 
     if(chargerPin[i] == 255) { ... ESP.restart(); }
     pinMode(chargerPin[i], OUTPUT);
+    digitalWrite(chargerPin[i], HIGH);   // park charger on NC contact (coil de-energised) at boot
     i++;
 }
 i = 0;
@@ -388,6 +400,8 @@ prefs.end();
 ```
 
 The actual GPIO numbers for each relay channel are stored in NVS under single-character keys. Starting from `"A"` (ASCII 65), each successive key maps to the next relay channel in order. Only `totalPins` keys need to exist — unused relay positions on the module do not need NVS entries.
+
+**Boot state — chargers are explicitly parked, lights take the Arduino default.** After `pinMode(chargerPin[i], OUTPUT)` the code calls `digitalWrite(chargerPin[i], HIGH)` for every charger pin. Per the [relay contact logic in Section 2](#relay-module), HIGH drives the coil **de-energised**, which parks the relay on its **NC (Normally Closed)** contact. The corresponding loop for `lightPin[]` deliberately omits the explicit `digitalWrite` — light pins take the Arduino default of `LOW` straight out of `pinMode`, which energises the coil and seats the relay on its **NO (Normally Open)** contact. The asymmetry is a deliberate safe-state at power-on: a charger sitting on its NC contact will not start delivering current the instant the GPIO peripheral comes online, before the WiFi / MQTT / `cmnd` stack has finished initialising and the cloud has had a chance to assert a desired state. Lights are considered safe to come up on NO and were not given the same treatment.
 
 **Why single-character keys?** NVS key names must be short (max 15 characters). Single characters are the most compact option and perfectly sufficient for up to 16 channels (`"A"` through `"P"`).
 
@@ -437,7 +451,7 @@ Runs once on power-on / reset. Execution order matters here:
 5. **`getDeviceSpecificConfig()`** — Load all credentials and pin mapping from NVS. Reboots (with `STATE_ERROR` = solid red LED) on any failure.
 6. **`delay(3000)`** — A 3-second pause letting hardware, the radio subsystem, and internal peripherals stabilise before making network calls.
 7. **`initWiFiConnection(ssid, wifiPassword)`** — Sets the LED to `STATE_WIFI_CONNECTING` (yellow) internally, then connects. Blocks until connected or reboots after 20 failed attempts (with LED on `STATE_ERROR`).
-8. **`initMqtt()`** — Start the MQTT client. Returns immediately; the LED stays yellow until `MQTT_EVENT_CONNECTED` fires in the background and flips it to `STATE_ALL_IS_WELL` (dim green).
+8. **`initMqtt()`** — Start the MQTT client. Flips the LED to `STATE_MQTT_CONNECTING` (orange) on entry, then returns immediately. The LED stays orange until `MQTT_EVENT_CONNECTED` fires in the background and flips it to `STATE_ALL_IS_WELL` (dim green).
 
 ### `loop()`
 
@@ -554,6 +568,8 @@ A file-scope global handle to the MQTT client instance. Stored at file scope so 
 
 #### `initMqtt()`
 
+Sets the status LED to `STATE_MQTT_CONNECTING` (orange) at entry — the LED stays orange from the moment WiFi is up and the MQTT client is being configured, until `MQTT_EVENT_CONNECTED` flips it to dim green. This is the live call site for that state code (see [Section 10](#10-status-led--srcstatusmanager)).
+
 Builds the MQTT client configuration struct and starts the client:
 
 ```cpp
@@ -595,9 +611,17 @@ This is a **FreeRTOS event handler callback** — it runs on the MQTT client's i
 ```cpp
 Serial.println("Connected to GridFlow EMQX Server");
 esp_mqtt_client_enqueue(client, testTopic, "GF-KD1-Test --> Online", 0, 0, 0, true);
+
 String cmndTopic = "cmnd/" + username + "/#";
 esp_mqtt_client_subscribe(client, cmndTopic.c_str(), 2);
+
+String confTopic = "conf/" + username + "/#";
+esp_mqtt_client_subscribe(client, confTopic.c_str(), 2);
+
+esp_mqtt_client_subscribe(client, "cmnd/all/#", 2);
+
 globalErrorCounter = 0;
+statusHandler(STATE_ALL_IS_WELL);
 ```
 
 When the client successfully connects to the broker:
@@ -605,8 +629,9 @@ When the client successfully connects to the broker:
 2. Publishes a retained "Online" announcement to the dev `testTopic` ("test").
 3. Builds the per-device wildcard subscription `cmnd/<username>/#` at runtime and subscribes at QoS 2 (exactly-once delivery). This catches every `cmnd/<this-device>/...` topic the broker routes to it, including the `cycle` subtopics.
 4. Subscribes to `conf/<username>/#` at QoS 2 (health/state/reboot/edit requests).
-5. Resets `globalErrorCounter` to 0 — a successful (re)connect clears the error budget that drives the auto-reboot in `loop()`.
-6. Calls `statusHandler(STATE_ALL_IS_WELL)` to flip the onboard status LED to dim green — the "everything is healthy" signal.
+5. Subscribes to `cmnd/all/#` at QoS 2. This is the **broadcast** channel — any cloud-side publisher can address every device in the fleet at once by publishing to `cmnd/all/...` (e.g. `cmnd/all/light/0` with payload `"1"` turns on light channel 0 on every connected device). The device-ID check inside `MQTT_EVENT_DATA` accepts `segment[1] == "all"` in addition to its own `username`, so the same `cmnd()` dispatch handles broadcast and per-device commands uniformly.
+6. Resets `globalErrorCounter` to 0 — a successful (re)connect clears the error budget that drives the auto-reboot in `loop()`.
+7. Calls `statusHandler(STATE_ALL_IS_WELL)` to flip the onboard status LED to dim green — the "everything is healthy" signal.
 
 **`MQTT_EVENT_DISCONNECTED`**
 
@@ -638,16 +663,15 @@ case MQTT_EVENT_DATA: {
         token = strtok_r(NULL, "/", &savePtr);
     }
 
-    if (tokenCount < 4) return;
+    if (tokenCount < 3) return;
 
     char payload[event->data_len + 1];
     memcpy(payload, event->data, event->data_len);
     payload[event->data_len] = '\0';
 
-    if(strcmp(segment[1], username.c_str()) == 0) {
+    if(strcmp(segment[1], username.c_str()) == 0 || strcmp(segment[1], "all") == 0) {
         if(strcmp(segment[0], "cmnd") == 0) cmnd(segment, tokenCount, payload);
-        // if(strcmp(segment[0], "stat") == 0) stat(segment, tokenCount, payload);
-        // if(strcmp(segment[0], "tele") == 0) tele(segment, tokenCount, payload);
+        if(strcmp(segment[0], "conf") == 0) conf(segment, tokenCount, payload);
     } else {
         Serial.println("Client ID Mismatch");
     }
@@ -663,16 +687,16 @@ case MQTT_EVENT_DATA: {
 
 **Why manual null-termination?** The ESP-IDF MQTT event struct gives you `event->topic` (a raw pointer) and `event->topic_len` (an integer length). The pointer points into an internal buffer that is **not** null-terminated. Standard C string functions like `strtok_r` and `strcmp` require null-terminated strings, so the code manually copies the data into local stack arrays and appends `'\0'`. The initial `Serial.printf` avoids this copy by using `%.*s`, which takes an explicit length instead of relying on a null terminator.
 
-**Why `tokenCount < 4`?** Every valid routable topic has at least 4 segments — for `cmnd`, the structure is `cmnd/<dev>/<group>/<channelID>`, which is 4 tokens. Accessing `segment[3]` without proof that at least 4 segments were parsed would be reading uninitialised stack memory. The guard is intentionally a hard `< 4` (not `< 3`) because every currently-routed handler needs `segment[3]`. Handlers that need **more** than 4 segments (e.g. the cycle sub-command which uses `segment[4]`) must do their own additional length check inside the handler — see `cmnd.cpp:18` (`seg_len >= 5`).
+**Why `tokenCount < 3`?** Every valid routable topic has at least 3 segments — `<root>/<dev>/<sub>`. `conf/<dev>/health`, `conf/<dev>/state`, and `conf/<dev>/reboot` are exactly 3 segments and must be allowed through. Handlers that need `segment[3]` (every `cmnd` path; `conf/edit`) do their own tighter check inside the handler — `cmnd()` enforces `seg_len < 4`, and `conf()`'s `edit` branch enforces `seg_len >= 5`.
 
 **Topic routing logic:**
 - `segment[0]` — the root namespace: `cmnd`, `stat`, `tele`, or `conf`.
-- `segment[1]` — the device ID (verified against `username` to ensure this message is addressed to this device).
+- `segment[1]` — the device ID, verified against `username` **or** the literal string `"all"`. The `"all"` match is what makes `cmnd/all/...` work as a fleet-wide broadcast — see the `MQTT_EVENT_CONNECTED` subscription list above.
 - `segment[2+]` — sub-topic levels passed to the handler for further dispatch.
 
-Only the `cmnd` dispatch is currently live. `stat`/`tele` are present as commented lines so they can be activated as their handlers ship; `conf` is not wired up at all yet (its `#include` is missing and there is no dispatch line, not even commented).
+Both `cmnd` and `conf` dispatches are live. `stat` and `tele` are device-to-cloud only and have no dispatch lines — the device never receives its own `stat/` publishes and `tele/` has no handler yet.
 
-**Device-ID filter is active.** Because the broker subscription is `cmnd/<this-device>/#`, the broker should never deliver a message addressed to another device. The `segment[1] == username` check is a defence-in-depth — if a misconfigured ACL or a wildcard subscription ever leaks another device's traffic to this client, the `Client ID Mismatch` log makes it visible.
+**Device-ID filter is active, with a broadcast escape hatch.** Because the broker subscriptions are `cmnd/<this-device>/#`, `conf/<this-device>/#`, and `cmnd/all/#`, the broker should never deliver a non-`all` message addressed to another device. The `segment[1] == username || segment[1] == "all"` check is a defence-in-depth — if a misconfigured ACL or a wildcard subscription ever leaks another device's traffic to this client, the `Client ID Mismatch` log makes it visible.
 
 **`MQTT_EVENT_ERROR`**
 
@@ -750,9 +774,9 @@ cmnd/<device_id>/(charger|light)/<channelID>          # on/off
 cmnd/<device_id>/charger/<channelID>/cycle            # timed off-then-on
 ```
 
-`segment[2]` selects the relay group (`charger` or `light`). `segment[3]` is the zero-based channel index within that group — `0` through `pinOffset-1` for chargers, `0` through `totalPins-pinOffset-1` for lights. `segment[4]`, when present, selects a sub-command (currently only `cycle`).
+`segment[2]` selects the relay group (`charger` or `light`). `segment[3]` is either the zero-based channel index within that group — `0` through `pinOffset-1` for chargers, `0` through `totalPins-pinOffset-1` for lights — or the literal string `"all"` (currently supported on the `light` branch only — see "light/all broadcast" below). `segment[4]`, when present, selects a sub-command (currently only `cycle`).
 
-`cmnd()` has its own `seg_len < 4` guard at the top — every routed path needs `segment[3]`, and the broker-level guard in `mqttManager.cpp` is now relaxed to `< 3` (to allow 3-segment `conf/<dev>/health` etc. through to the conf handler). The handler then dispatches to one of three internal functions, captures the integer return status, and publishes a single ack to `stat/<dev>/ack` summarising the result.
+`cmnd()` enforces its own `seg_len < 4` guard at the top (early return) — every routed path needs `segment[3]`. The broker-level guard in `mqttManager.cpp` is `< 3` (to allow 3-segment `conf/<dev>/health` etc. through to the conf handler), so the channel-index check has to be repeated here. After dispatch, the handler captures the integer return `status` (initialised to `-1`, set by whichever sub-handler runs) and publishes a single ack to `stat/<dev>/ack` summarising the result. The `charger` / `light` branches are chained with `else if`, so once one matches the other is not re-evaluated. A topic whose `segment[2]` is neither `"charger"` nor `"light"` falls into a default branch that returns **without** acking — the firmware deliberately does not confirm topics it silently dropped.
 
 **`charger(int chargerID, bool state)`**
 - Bounds-checks `chargerID >= pinOffset` and returns `-1` if out of range.
@@ -768,11 +792,13 @@ cmnd/<device_id>/charger/<channelID>/cycle            # timed off-then-on
 - Logs `Light <id> (GPIO <n>) -> ON/OFF`.
 - Returns `0` on success.
 
-Both `segment[3]` and `payload` are passed through `atoi()` at the call site — `segment[3]` is the channel index as a string (e.g., `"2"`), and `payload` is `"1"` or `"0"`. `atoi()` converts both to integers; the integer `0`/`1` then implicitly converts to `bool` for the `state` parameter.
+**`light/all` broadcast.** When `segment[3]` is the literal string `"all"` on the light branch, `cmnd()` iterates every light channel and calls `light(i, state)` for each. If any single `light(i, state)` returns non-zero, the overall `status` is set to `-1` so the eventual ack reports `"ok": false`. The fleet-broadcast composition is therefore: publish `cmnd/all/light/all` with payload `"0"` and every device drops every light at once. The charger branch does not currently support the `"all"` channel form — only `light` does.
+
+Both `segment[3]` and `payload` are passed through `atoi()` at the call site (when `segment[3]` is a numeric channel index) — `segment[3]` is the channel index as a string (e.g., `"2"`), and `payload` is `"1"` or `"0"`. `atoi()` converts both to integers; the integer `0`/`1` then implicitly converts to `bool` for the `state` parameter. The `"all"` form is detected as a string compare before the `atoi` path.
 
 > **Payload caveat:** `atoi()` returns 0 for any non-numeric string. So `"1"` → ON, `"0"` → OFF, but `"ON"` / `"OFF"` / `"on"` / `"off"` all parse as 0 and turn the relay OFF. Use numeric payloads only, or replace the `atoi()` parse with `strcmp()` / JSON if word-form payloads need to be supported.
 
-Example: `cmnd/GF-B1/charger/1` with payload `1` closes charger relay 1 — sets `chargerPin[1]` HIGH, sets `relayState[1] = 1`, then publishes `stat/GF-B1/ack` with `{"topic":"cmnd/GF-B1/charger/1","ok":true,"t":<ms>}`.
+Example: `cmnd/GF-B1/charger/1` with payload `"1"` → `state=true` → `digitalWrite(chargerPin[1], HIGH)` — per the [relay contact logic](#relay-module), HIGH parks the relay on its **NC contact** (coil de-energised). Sets `relayState[1] = 1`, then publishes `stat/GF-B1/ack` with `{"topic":"cmnd/GF-B1/charger/1","ok":true,"t":<ms>}`. Payload `"0"` → `state=false` → `LOW` → **NO contact** (coil energised).
 
 **`cycle(unsigned int timeInSeconds, char *segment[])`** — timed off-then-on cycle for one charger channel. Used to drop and re-energise a charger after a fixed delay (e.g. to reset a downstream device or to throttle current draw).
 
@@ -874,7 +900,7 @@ Defined in `statusManager.h` as `#define` constants:
 |------|------|-------|---------|
 | `0`   | `STATE_BOOT`              | dim white | Set at the very top of `setup()`, before anything else |
 | `1`   | `STATE_WIFI_CONNECTING`   | yellow    | Set inside `initWiFiConnection()` and `checkWiFiStatus()` while attempting to (re)connect |
-| `2`   | `STATE_MQTT_CONNECTING`   | orange    | (Reserved — no current call site; reserved for "WiFi up, MQTT handshake in flight") |
+| `2`   | `STATE_MQTT_CONNECTING`   | orange    | Set at the top of `initMqtt()` — WiFi is up and the MQTT client is being configured / handshaking; cleared by `MQTT_EVENT_CONNECTED` flipping the LED to dim green |
 | `3`   | `STATE_MQTT_DISCONNECTED` | cyan      | `MQTT_EVENT_DISCONNECTED` — link to broker dropped, client is retrying |
 | `4`   | `STATE_ALL_IS_WELL`       | dim green | `MQTT_EVENT_CONNECTED` — full stack healthy |
 | `255` | `STATE_ERROR`             | solid red | Any unrecoverable error path — NVS validation failure, WiFi failure (about-to-reboot), `MQTT_EVENT_ERROR` |
@@ -909,6 +935,7 @@ The only public function. Switch-cases on the state code and writes the correspo
 | `wifiUtils/initWiFiConnection.cpp` entry | `statusHandler(STATE_WIFI_CONNECTING)` | Before the blocking connect loop |
 | `wifiUtils/initWiFiConnection.cpp` reboot branch | `statusHandler(STATE_ERROR)` | After 20 failed connect attempts |
 | `wifiUtils/checkWiFiStatus.cpp` | `statusHandler(STATE_WIFI_CONNECTING)` | Runtime WiFi loss detected (called from the 60 s `loop()` tick) |
+| `mqttManager.cpp::initMqtt()` entry | `statusHandler(STATE_MQTT_CONNECTING)` | MQTT client being configured / handshake in flight |
 | `mqttManager.cpp` MQTT_EVENT_CONNECTED | `statusHandler(STATE_ALL_IS_WELL)` | Broker handshake succeeded |
 | `mqttManager.cpp` MQTT_EVENT_DISCONNECTED | `statusHandler(STATE_MQTT_DISCONNECTED)` | Broker connection dropped |
 | `mqttManager.cpp` MQTT_EVENT_ERROR | `statusHandler(STATE_ERROR)` | MQTT-level error event |
@@ -929,29 +956,11 @@ An earlier iteration had a blink animation for the error state, driven from a `s
 
 ## 11. Debug Command Handler — `src/cmd.cpp`
 
-```cpp
-void cmd(char *payload) { ... }
-```
+> **Current status: both `cmd.h` and `cmd.cpp` are entirely commented out.** Every line in both files is inside a block comment. The files are retained as a historical reference for what the original debug commands were; nothing in them compiles or runs. `main.cpp` and `mqttManager.cpp` still `#include "cmd.h"` but since the header is fully commented the include is a no-op.
 
-This is an **earlier, simpler command handler** that predates the structured `cmnd`/`stat`/`tele`/`conf` routing. It accepts a raw payload string and dispatches on it directly, with no topic-level routing.
+The `cmd()` function was an **earlier, simpler command handler** that predated the structured `cmnd`/`stat`/`tele`/`conf` routing. It accepted a raw payload string and dispatched on it directly with no topic-level routing. The original payloads it handled were: `"reboot"` (hard reboot), `"red"` / `"blue"` / `"green"` / `"white"` / `"off"` (RGB LED control), `"rp"` / `"bp"` (RED_PIN/BLUE_PIN HIGH), `"gr"` (both HIGH), `"off_pin"` / `"on_pin"` (both LOW/HIGH).
 
-| Payload      | Action |
-|-------------|--------|
-| `"reboot"`   | `ESP.restart()` — hard reboot |
-| `"red"`      | Set onboard RGB LED to red (GRB order: `rgbLedWrite(LED_PIN, 0, 255, 0)`) |
-| `"blue"`     | Set onboard RGB LED to blue |
-| `"green"`    | Set onboard RGB LED to green |
-| `"white"`    | Set onboard RGB LED to white (all channels max) |
-| `"off"`      | Turn off the onboard RGB LED |
-| `"rp"`       | Set `RED_PIN` (GPIO 20) HIGH |
-| `"bp"`       | Set `BLUE_PIN` (GPIO 5) HIGH |
-| `"gr"`       | Set both `RED_PIN` and `BLUE_PIN` HIGH |
-| `"off_pin"`  | Set both `RED_PIN` and `BLUE_PIN` LOW |
-| `"on_pin"`   | Set both `RED_PIN` and `BLUE_PIN` HIGH |
-
-> **Current status:** The call `cmd(payload)` inside `MQTT_EVENT_DATA` is commented out. This function was used for quick hardware testing and has been superseded by the structured topic routing. It may be repurposed or removed.
-
-> **GRB quirk:** The comment in the code explicitly warns: *"for some reason it is G R B instead of RGB so be careful."* The `rgbLedWrite()` Arduino helper accepts `(pin, r, g, b)` but the WS2812 LED on the ESP32-C3-DevKitM-1 uses GRB wire order. The calls compensate by swapping R and G: `rgbLedWrite(LED_PIN, 0, 255, 0)` produces red (not green) because the LED physically sees `G=0, R=255, B=0`.
+The call site `cmd(payload)` inside `MQTT_EVENT_DATA` is in a `/* DEPRECIATED */` block and also does not compile since the function is no longer declared. These files will likely be deleted in a future cleanup pass.
 
 ---
 
@@ -989,9 +998,9 @@ flowchart TB
 
         subgraph EvtCtx["mqtt_event_handler() — MQTT FreeRTOS task"]
             direction TB
-            conn["CONNECTED:<br/>• publish 'Online' → testTopic<br/>• subscribe cmnd/&lt;user&gt;/# QoS 2<br/>• subscribe conf/&lt;user&gt;/# QoS 2<br/>• globalErrorCounter = 0<br/>• LED → dim green (STATE_ALL_IS_WELL)"]
+            conn["CONNECTED:<br/>• publish 'Online' → testTopic<br/>• subscribe cmnd/&lt;user&gt;/# QoS 2<br/>• subscribe conf/&lt;user&gt;/# QoS 2<br/>• subscribe cmnd/all/# QoS 2 (broadcast)<br/>• globalErrorCounter = 0<br/>• LED → dim green (STATE_ALL_IS_WELL)"]
             disc["DISCONNECTED:<br/>• log (client auto-reconnects)<br/>• LED → cyan (STATE_MQTT_DISCONNECTED)"]
-            data["DATA:<br/>• tokenise on '/'<br/>• guard tokenCount &lt; 3<br/>• verify segment[1] == username<br/>• dispatch on segment[0]<br/>• (details ⇩ message flow)"]
+            data["DATA:<br/>• tokenise on '/'<br/>• guard tokenCount &lt; 3<br/>• verify segment[1] == username OR 'all'<br/>• dispatch on segment[0] (cmnd / conf)<br/>• (details ⇩ message flow)"]
             err["ERROR:<br/>• globalErrorCounter++<br/>• LED → solid red (STATE_ERROR)"]
             conn --- disc --- data --- err
         end
@@ -1003,7 +1012,7 @@ flowchart TB
     NVS -. read at boot .-> cfg
     WiFiNet === wifi
     mqttI ==>|"TLS / MQTT :8883"| Broker
-    Broker ==>|"cmnd/&lt;u&gt;/# and conf/&lt;u&gt;/#"| data
+    Broker ==>|"cmnd/&lt;u&gt;/# · conf/&lt;u&gt;/# · cmnd/all/#"| data
     EvtCtx ==>|"stat/&lt;u&gt;/health (retained)<br/>stat/&lt;u&gt;/state (retained)<br/>stat/&lt;u&gt;/ack"| Broker
 ```
 
@@ -1024,12 +1033,12 @@ flowchart LR
         T7["conf/&lt;u&gt;/edit/&lt;ns&gt;/&lt;key&gt;<br/>payload: new value"]
     end
 
-    Disp{{"MQTT_EVENT_DATA<br/>tokenise + dispatch<br/>(guard tokenCount &lt; 3,<br/>segment[1] == username)"}}
+    Disp{{"MQTT_EVENT_DATA<br/>tokenise + dispatch<br/>(guard tokenCount &lt; 3,<br/>segment[1] == username OR 'all')"}}
 
     subgraph CmndH["cmnd() &nbsp;[guard seg_len &lt; 4]"]
         direction TB
         cmCharger["charger(id, state)<br/>digitalWrite chargerPin[id]<br/>relayState[id] = 0|1<br/>return 0 | −1"]
-        cmLight["light(id, state)<br/>digitalWrite lightPin[id]<br/>relayState[pinOffset + id] = 0|1<br/>return 0 | −1"]
+        cmLight["light(id, state) — or 'all' fan-out<br/>digitalWrite lightPin[id]<br/>relayState[pinOffset + id] = 0|1<br/>return 0 | −1 (−1 if any channel<br/>fails in the 'all' form)"]
         cmCycle["cycle(sec, segment)<br/>charger(id, false)<br/>arm cycleFlag / cycleStart /<br/>cycleInterval / cycleID<br/>return 0 | −1"]
         cmExit["statAck(segment, seg_len, status == 0)"]
         cmCharger --> cmExit
@@ -1175,8 +1184,12 @@ So `segment[0]` = root, `segment[1]` = device ID, `segment[2+]` = action-specifi
 
 ```
 cmnd/<device_id>/(charger|light)/<channelID>          # on/off
+cmnd/<device_id>/light/all                            # on/off, fan-out to every light channel
 cmnd/<device_id>/charger/<channelID>/cycle            # timed off-then-on
+cmnd/all/...                                          # fleet broadcast (any topic above, addressed to every device)
 ```
+
+`<device_id>` may be either this device's own `username` (from NVS) or the literal string `"all"`. The broker subscription `cmnd/all/#` is added at every `MQTT_EVENT_CONNECTED`, so a publisher addressing `cmnd/all/light/0` reaches every connected device simultaneously and each one runs its own `cmnd()` dispatch.
 
 | Topic | Payload | Direction | Meaning |
 |-------|---------|-----------|---------|
@@ -1184,7 +1197,10 @@ cmnd/<device_id>/charger/<channelID>/cycle            # timed off-then-on
 | `cmnd/GF-B1/charger/1` | `"1"` / `"0"` | Cloud → Device | Set charger relay 1 ON / OFF |
 | `cmnd/GF-B1/light/0`   | `"1"` / `"0"` | Cloud → Device | Set light relay 0 ON / OFF |
 | `cmnd/GF-B1/light/1`   | `"1"` / `"0"` | Cloud → Device | Set light relay 1 ON / OFF |
+| `cmnd/GF-B1/light/all` | `"1"` / `"0"` | Cloud → Device | Set **every** light channel ON / OFF on this device |
 | `cmnd/GF-B1/charger/0/cycle` | `"<seconds>"` (e.g. `"5"`) | Cloud → Device | Drop charger 0, then re-energise after N seconds. Non-blocking. |
+| `cmnd/all/light/all` | `"1"` / `"0"` | Cloud → **Every device** | Fleet broadcast: every device runs `light/all` |
+| `cmnd/all/charger/<id>` | `"1"` / `"0"` | Cloud → **Every device** | Fleet broadcast: every device sets its own charger `<id>` to the given state |
 
 Payload semantics: numeric only. `atoi()` is used for parsing, so `"ON"`/`"OFF"` parse as 0 and turn the relay OFF — use `"1"`/`"0"` for on/off, and a positive integer for `cycle`.
 
@@ -1208,7 +1224,7 @@ conf/<device_id>/edit/<namespace>/<key>     payload=<value>   # NVS write, then 
 
 | Topic | QoS | Retain | Body | Trigger |
 |-------|-----|--------|------|---------|
-| `stat/GF-B1/health` | 2 | yes | `{"heap":<n>,"rssi":<dBm>,"uptime_ms":<n>,"err":<n>}` | `conf/<dev>/health` request (planned: also 60 s loop tick) |
+| `stat/GF-B1/health` | 2 | yes | `{"heap":<n>,"rssi":<dBm>,"uptime_ms":<n>,"err":<n>}` | 60 s `loop()` heartbeat; on-demand via `conf/<dev>/health` |
 | `stat/GF-B1/state` | 2 | yes | `{"chargers":[0|1,...],"lights":[0|1,...]}` | `conf/<dev>/state` request |
 | `stat/GF-B1/ack` | 2 | no | `{"topic":"<original topic>","ok":true|false,"t":<ms>}` | Every `cmnd` and every `conf/edit` |
 
@@ -1223,6 +1239,7 @@ conf/<device_id>/edit/<namespace>/<key>     payload=<value>   # NVS write, then 
 | Component | File | Status | Notes |
 |-----------|------|--------|-------|
 | `tele` handler | `src/functions/tele/` | Header only | No `.cpp` file; sensors not yet connected; no dispatch line in `mqttManager.cpp` and no subscription |
+| `relayState` boot sync | `config.cpp` / `cmnd.cpp` | Out of sync at power-on | Charger GPIOs are driven `HIGH` in `getDeviceSpecificConfig()` but `relayState[]` is zero-initialised and not updated there. A `conf/<dev>/state` before the first `cmnd` returns `0` for all chargers even though their GPIOs are `HIGH`. Fix: initialise `relayState[i] = 1` alongside each `digitalWrite(chargerPin[i], HIGH)` in the pin-mapping loop |
 | Auto `statState()` on every relay change | `cmnd.cpp` `charger()` / `light()` | Not wired | Currently only published on `conf/<dev>/state` request. Calling `statState()` after each mutation would let dashboards stay in sync without polling |
 | Per-channel cycle bookkeeping | `cmnd.cpp:7–10` | Single-slot only | `cycleFlag`/`cycleID`/`cycleStart`/`cycleInterval` are scalars — a second cycle command overwrites any in-flight cycle. Needs to become per-channel arrays if concurrent cycles are required |
 | Cycle payload validation | `cmnd.cpp:18` | Loose | `seg_len >= 5` permits a cycle topic with no payload-seconds; `atoi()` parse falls through to 0 → instant flicker. Tighten to `seg_len >= 5 && atoi(payload) > 0` or use JSON when payload schema firms up |
