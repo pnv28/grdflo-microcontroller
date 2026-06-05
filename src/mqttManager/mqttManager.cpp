@@ -41,10 +41,14 @@ static void mqtt_event_handler(void* handler_args, esp_event_base_t base, int32_
       break;
 
     case MQTT_EVENT_DATA: {
-      if (event->current_data_offset != 0 || event->data_len != event->total_data_len) {
-        Serial.println("Fragmented MQTT message — dropping");
+      if(event->current_data_offset != 0 || event->data_len != event->total_data_len) {
+        Serial.println("Fragmented MQTT message --> dropping");
         break;
       }
+      if(event->topic_len > 256 || event->data_len > 256) {
+        Serial.println("Oversized topic or message length --> dropping");
+        break;
+      } 
       Serial.printf("Message Received in topic %.*s: ", event->topic_len, event->topic);
       Serial.printf("%.*s\n", event->data_len, event->data);
 
@@ -106,7 +110,7 @@ static void mqtt_event_handler(void* handler_args, esp_event_base_t base, int32_
 void initMqtt() {
   statusHandler(STATE_MQTT_CONNECTING);
   esp_mqtt_client_config_t mqtt_cfg = {};
-  mqtt_cfg.session.keepalive = 20;
+  mqtt_cfg.session.keepalive = 30;
   mqtt_cfg.broker.address.uri = brokerUri;
   mqtt_cfg.credentials.client_id = username.c_str();
   mqtt_cfg.credentials.username = username.c_str();

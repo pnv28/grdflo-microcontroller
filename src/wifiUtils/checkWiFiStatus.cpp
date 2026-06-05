@@ -1,6 +1,6 @@
 #include "wifiUtils.h"
 
-long WiFiDiconnectSince = 0;
+unsigned long WiFiDiconnectSince = 0;
 
 void checkWiFiStatus(const char *ssid, const char *password) {
     if (WiFi.status() != WL_CONNECTED) {
@@ -8,5 +8,7 @@ void checkWiFiStatus(const char *ssid, const char *password) {
       Serial.println("WiFi lost, reconnecting...");
       WiFi.reconnect();
       WiFiDiconnectSince = millis();
+      return;
     }
+    WiFiDiconnectSince = 0;
 }
