@@ -12,7 +12,8 @@ subcommands:
 */
 
 void conf(char *segment[], const size_t seg_len, const char *payload) {
-    if (seg_len < 3) return;
+    if(seg_len < 3) return;
+    if(strcmp(segment[1], "all") == 0) return;
 
     if(strcmp(segment[2], "health") == 0) {
         statHealth();

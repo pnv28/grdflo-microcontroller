@@ -35,6 +35,8 @@ After tokenising the topic, the code accessed `segment[1]` directly with no chec
 
 ### 3. `esp_mqtt_client_init()` return value is not checked
 
+> fixed
+
 **File:** `src/mqttManager/mqttManager.cpp`, line 97
 
 **The problem:**
@@ -118,6 +120,8 @@ Re-enable the structured routing block above the `cmd(payload)` call (and apply 
 
 ### 5. `MQTT_EVENT_ERROR` logs nothing useful
 
+> fixed
+
 **File:** `src/mqttManager/mqttManager.cpp`, line 71
 
 **The problem:**
@@ -180,6 +184,8 @@ A fixed size of `[10]` would have been the wrong approach anyway — the actual 
 
 ### 8. `cmd.cpp` uses a chain of `if` instead of `else if`
 
+> DEPRECIATED
+
 **File:** `src/cmd.cpp`, lines 7–42
 
 **The problem:**
@@ -205,6 +211,8 @@ else if(strcmp(payload, "blue") == 0) { ... }
 ---
 
 ### 9. Missing newline in the heap print
+
+> Fixed
 
 **File:** `src/main.cpp`, line 42
 

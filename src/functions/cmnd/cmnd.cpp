@@ -11,25 +11,29 @@ unsigned long cycleStart = 0;
 bool cycleFlag = false;
 
 void cmnd(char *segment[], const size_t seg_len, const char *payload) {
-    if (seg_len < 4) return;
+    if (seg_len < 3) return;
 
     int status = -1;
 
     if(strcmp(segment[2], "charger") == 0) {
         if(seg_len >= 5 && strcmp(segment[4], "cycle") == 0) {
             status = cycle(atoi(payload), segment);
-        } else {
+        } else if(seg_len >= 4) {
             status = charger(atoi(segment[3]), atoi(payload));
+        } else {
+            return;
         }
     } else if(strcmp(segment[2], "light") == 0) {
-        if(strcmp(segment[3], "all") == 0) {
+        if(strcmp(segment[1], "all") == 0 || (seg_len >= 4 && strcmp(segment[3], "all") == 0)) {
             status = 0;
             for(int i = 0; i < (totalPins-pinOffset); i++) {
                 int tempStatus = light(i, atoi(payload));
                 if(tempStatus != 0) status = -1;
             }
-        } else {
+        } else if(seg_len >= 4) {
             status = light(atoi(segment[3]), atoi(payload));
+        } else {
+            return;
         }
     } else {
         return; // unrecognised group — don't ack a topic we ignored

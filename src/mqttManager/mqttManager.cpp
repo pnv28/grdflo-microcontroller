@@ -84,8 +84,14 @@ static void mqtt_event_handler(void* handler_args, esp_event_base_t base, int32_
     case MQTT_EVENT_ERROR:
       statusHandler(STATE_ERROR);
       Serial.println("MQTT_EVENT_ERROR");
-      globalErrorCounter++;
-      break;
+      if (event->error_handle->error_type == MQTT_ERROR_TYPE_TCP_TRANSPORT) {
+        Serial.printf("  Transport error: %d\n", event->error_handle->esp_transport_sock_errno);
+    }
+    if (event->error_handle->error_type == MQTT_ERROR_TYPE_CONNECTION_REFUSED) {
+        Serial.printf("  Connection refused, code: %d\n", event->error_handle->connect_return_code);
+    }
+    globalErrorCounter++;
+    break;
 
     default:
       break;
@@ -110,6 +116,13 @@ void initMqtt() {
   // mqtt_cfg.session.last_will.retain  = 1;
 
   client = esp_mqtt_client_init(&mqtt_cfg);
+  if(client == NULL) {
+    Serial.println("MQTT Initialization failed, rebooting");
+    statusHandler(STATE_ERROR);
+    delay(5000);
+    ESP.restart();
+  }
+
   esp_mqtt_client_register_event(client, (esp_mqtt_event_id_t) ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
   esp_mqtt_client_start(client);
 }
