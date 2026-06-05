@@ -32,7 +32,7 @@ void setup() {
 
   getDeviceSpecificConfig();
 
-  delay(3000); // waiting for everything to initialise
+  delay(3000); // Waiting for all components to initialise, mainly WiFi related hardware, such that when we try to connect everything is on and running.
   initWiFiConnection(ssid.c_str(), wifiPassword.c_str());
 
   initMqtt();
@@ -51,14 +51,21 @@ void loop() {
     }
   }
 
+  if((currMillis - WiFiDiconnectSince) >= 180000) {
+    statusHandler(STATE_ERROR);
+    ESP.restart();
+  }
+
   if((currMillis - prevMillis) >= interval) {
     prevMillis = currMillis;
     Serial.printf("[%lu]Free heap: %d bytes\n", currMillis, ESP.getFreeHeap());
 
     if(globalErrorCounter >= 5) {
+      statusHandler(STATE_ERROR);
       ESP.restart();
     }
     statHealth();
+    statState();
     checkWiFiStatus(ssid.c_str(), wifiPassword.c_str()); 
   }
 }

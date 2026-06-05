@@ -22,10 +22,10 @@ static void mqtt_event_handler(void* handler_args, esp_event_base_t base, int32_
       String onlineMessageTopic = "stat/" + username + "/onoff";
       esp_mqtt_client_enqueue(client, onlineMessageTopic.c_str(), "{\"status\": \"online\"}", 0, 2, 1, true);
       String cmndTopic = "cmnd/" + username + "/#";
-      esp_mqtt_client_subscribe(client, cmndTopic.c_str(), 2);
+      esp_mqtt_client_subscribe(client, cmndTopic.c_str(), 1);
       String confTopic = "conf/" + username + "/#";
-      esp_mqtt_client_subscribe(client, confTopic.c_str(), 2);
-      esp_mqtt_client_subscribe(client, "cmnd/all/#", 2);
+      esp_mqtt_client_subscribe(client, confTopic.c_str(), 1);
+      esp_mqtt_client_subscribe(client, "cmnd/all/#", 1);
       globalErrorCounter = 0;
       statusHandler(STATE_ALL_IS_WELL);
       }
@@ -41,6 +41,10 @@ static void mqtt_event_handler(void* handler_args, esp_event_base_t base, int32_
       break;
 
     case MQTT_EVENT_DATA: {
+      if (event->current_data_offset != 0 || event->data_len != event->total_data_len) {
+        Serial.println("Fragmented MQTT message — dropping");
+        break;
+      }
       Serial.printf("Message Received in topic %.*s: ", event->topic_len, event->topic);
       Serial.printf("%.*s\n", event->data_len, event->data);
 

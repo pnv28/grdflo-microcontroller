@@ -4,6 +4,7 @@ void initWiFiConnection(const char *ssid, const char *password) {
     statusHandler(STATE_WIFI_CONNECTING);
     WiFi.setAutoReconnect(true);
     WiFi.persistent(false);
+    WiFi.setSleep(false);
     WiFi.begin(ssid, password);
     Serial.println("Trying to connect to WiFi");
     int attempts = 0;

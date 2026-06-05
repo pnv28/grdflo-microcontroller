@@ -8,4 +8,6 @@
 void initWiFiConnection(const char *ssid, const char *password);
 void checkWiFiStatus(const char *ssid, const char *password);
 
+extern unsigned long WiFiDiconnectSince;
+
 #endif

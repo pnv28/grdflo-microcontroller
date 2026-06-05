@@ -12,7 +12,7 @@ void statHealth() {
         globalErrorCounter);
 
     String topic = "stat/" + username + "/health";
-    mqttPublish(topic.c_str(), payload, 2, 1, true);
+    mqttPublish(topic.c_str(), payload, 1, 1, true);
 }
 
 void statAck(const char *originTopic, bool ok) {
@@ -24,7 +24,7 @@ void statAck(const char *originTopic, bool ok) {
         (unsigned long)millis());
 
     String topic = "stat/" + username + "/ack";
-    mqttPublish(topic.c_str(), payload, 2, 0, true);
+    mqttPublish(topic.c_str(), payload, 1, 0, true);
 }
 
 void statAck(char *segment[], size_t seg_len, bool ok) {
@@ -55,5 +55,5 @@ void statState() {
     snprintf(payload + n, sizeof(payload) - n, "]}");
 
     String topic = "stat/" + username + "/state";
-    mqttPublish(topic.c_str(), payload, 2, 1, true);
+    mqttPublish(topic.c_str(), payload, 1, 1, true);
 }

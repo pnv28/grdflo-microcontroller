@@ -25,6 +25,8 @@ After tokenising the topic, the code accessed `segment[1]` directly with no chec
 
 ### 2. `topic` variable shadows the global
 
+> Fixed
+
 > **Non-issue — moot.** This was filed against a global `const char* topic`, but the variable in `config.h` / `config.cpp` was always named `testTopic`, not `topic`. There is no global named `topic` for the local `char topic[...]` in `MQTT_EVENT_DATA` to shadow. The item is kept for historical reference.
 
 **File:** `src/mqttManager/mqttManager.cpp`
@@ -296,30 +298,7 @@ char payload[MAX_PAYLOAD_LEN];
 
 ---
 
-### 12. `esp_task_wdt_add()` return value not checked
-
-**File:** `src/main.cpp`, line 26
-
-**The problem:**
-
-```cpp
-esp_task_wdt_add(NULL);
-```
-
-If this fails (e.g., the task is already subscribed from a previous boot cycle without a clean reset), the call returns an error code that is silently ignored. The watchdog is then not actually protecting the main task and you won't know.
-
-**The fix:**
-
-```cpp
-esp_err_t wdt_err = esp_task_wdt_add(NULL);
-if (wdt_err != ESP_OK) {
-    Serial.printf("WDT add failed: %d\n", wdt_err);
-}
-```
-
----
-
-### 13. The `initWiFiConnection` blocking loop doesn't reset the WDT
+### 12. The `initWiFiConnection` blocking loop doesn't reset the WDT
 
 **File:** `src/wifiUtils/initWiFiConnection.cpp`, lines 9–13
 
@@ -346,7 +325,7 @@ while (WiFi.status() != WL_CONNECTED && attempts < 20) {
 
 ---
 
-### 14. No OTA (Over-The-Air) firmware update
+### 13. No OTA (Over-The-Air) firmware update
 
 This is the most important missing piece for any real deployment.
 
@@ -358,7 +337,7 @@ This is not urgent now, but should be planned before any device leaves your hand
 
 ---
 
-### 15. NVS partition is not encrypted
+### 14. NVS partition is not encrypted
 
 The credentials stored in NVS (WiFi password, MQTT password) are currently sitting in flash in plaintext. Anyone with physical access to the chip can dump the flash with `esptool.py` in under 30 seconds.
 
@@ -368,17 +347,17 @@ Not urgent during development, but something to plan for before devices go to cu
 
 ---
 
-### 16. Boot-time online announce still uses a hardcoded topic and label
+### 15. Boot-time online announce still uses a hardcoded topic and label
+
+> Fixed
 
 **Partially resolved.** The per-device subscriptions (`cmnd/<username>/#`, `conf/<username>/#`) are already built dynamically from `username` in `MQTT_EVENT_CONNECTED` — that part is done. What remains:
 
-```cpp
 // config.cpp
 const char* testTopic = "test";   // ← still hardcoded
 
 // mqttManager.cpp MQTT_EVENT_CONNECTED
 esp_mqtt_client_enqueue(client, testTopic, "GF-KD1-Test --> Online", ...);
-```
 
 Two things still need updating:
 1. The online announce topic (`testTopic = "test"`) should become `stat/<username>/online` to match the `stat/` namespace and pair with the future LWT.
@@ -386,13 +365,15 @@ Two things still need updating:
 
 ---
 
-### 17. No telemetry loop
+### 16. No telemetry loop
+
+> planned will do later
 
 The `tele` namespace is planned but nothing is published yet. A basic telemetry interval (free heap, WiFi RSSI, uptime) is very useful in production to detect slow memory leaks or degraded WiFi signal before they become outages. This can be added into the existing 60-second `loop()` interval once the MQTT topic structure is finalised.
 
 ---
 
-### 18. `MQTT_EVENT_ERROR` could re-enable the error counter
+### 17. `MQTT_EVENT_ERROR` could re-enable the error counter
 
 > fixed
 
@@ -405,7 +386,7 @@ Combined with proper error logging from item #5 above, the device will now self-
 
 ---
 
-### 19. `cmnd()` accesses `segment[3]` without checking `seg_len >= 4`
+### 18. `cmnd()` accesses `segment[3]` without checking `seg_len >= 4`
 
 > fixed
 
@@ -438,7 +419,9 @@ The upstream-guard approach is cleaner because the channel index is part of the 
 
 ---
 
-### 20. `charger()` / `light()` don't reject negative channel IDs
+### 19. `charger()` / `light()` don't reject negative channel IDs
+
+> Fixed
 
 **File:** `src/functions/cmnd/cmnd.cpp`, lines 34–64
 
@@ -469,7 +452,9 @@ Same applies to `light()`.
 
 ---
 
-### 21. `atoi(payload)` only parses numeric `0`/`1` — won't handle `"on"`/`"off"`/`"true"`/`"false"`
+### 20. `atoi(payload)` only parses numeric `0`/`1` — won't handle `"on"`/`"off"`/`"true"`/`"false"`
+
+> they will never receieve negative value so no worry
 
 **File:** `src/functions/cmnd/cmnd.cpp`, lines 26, 29
 
@@ -497,7 +482,9 @@ Either is fine — pick one and stick to it. Document the chosen format in `DOCU
 
 ---
 
-### 22. `MQTT_EVENT_DATA` doesn't handle fragmented (multi-chunk) messages
+### 21. `MQTT_EVENT_DATA` doesn't handle fragmented (multi-chunk) messages
+
+> fixed
 
 **File:** `src/mqttManager/mqttManager.cpp`, lines 32–69
 
@@ -595,6 +582,8 @@ int mqttPublish(...) {
 
 ### 26. `MQTT_EVENT_CONNECTED` publishes a hardcoded `"GF-KD1-Test --> Online"` to literal `"test"`
 
+> Fixed
+
 **File:** `src/mqttManager/mqttManager.cpp`, lines 20–21
 
 ```cpp
@@ -612,6 +601,8 @@ Related to items #16 (dynamic topic) and #29 (Last Will payload format).
 ---
 
 ### 27. Subscribe QoS is 2 but publish QoS is 0 — inconsistent and overbuilt
+
+> Fixed
 
 **File:** `src/mqttManager/mqttManager.cpp`, lines 20–21
 
@@ -641,6 +632,8 @@ Move both into NVS (e.g. namespace `mqttCfg`, keys `brokerUri` and `caCert`) and
 ---
 
 ### 29. Last Will Testament is commented out
+
+> Fixed
 
 **File:** `src/mqttManager/mqttManager.cpp`, lines 90–95
 
@@ -713,6 +706,8 @@ No `JsonDocument`, no `serializeJson`, no `deserializeJson` calls anywhere in th
 
 ### 33. `else if(!state)` in `charger()` / `light()` is redundant
 
+> Idc
+
 **File:** `src/functions/cmnd/cmnd.cpp`, lines 41–45, 57–61
 
 ```cpp
@@ -740,6 +735,8 @@ digitalWrite(chargerPin[chargerID], state ? HIGH : LOW);
 
 ### 34. `for(counter; ...)` with empty initializer in `config.cpp`
 
+> my coding style
+
 **File:** `src/config.cpp`, line 91
 
 ```cpp
@@ -755,6 +752,8 @@ for(; counter < (65 + totalPins); counter++) {
 ---
 
 ### 35. Magic literal `65` (ASCII `'A'`) in NVS key generation
+
+> not a bug design choice
 
 **File:** `src/config.cpp`, lines 74, 91
 
