@@ -92,6 +92,7 @@ void getDeviceSpecificConfig() {
 
         pinMode(chargerPin[i], OUTPUT);
         digitalWrite(chargerPin[i], HIGH);
+        relayState[i] = 1;
 
         i++;
     }

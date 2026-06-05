@@ -25,8 +25,7 @@ void setup() {
   statusHandler(STATE_BOOT);
   Serial.begin(115200);
 
-  pinMode(RED_PIN, OUTPUT);
-  pinMode(BLUE_PIN, OUTPUT);
+  Serial.printf("BOOT TIME FREE HEAP: %d\n", ESP.getFreeHeap());
 
   esp_task_wdt_reconfigure(&wdt_cfg);
   esp_task_wdt_add(NULL);
@@ -54,7 +53,7 @@ void loop() {
 
   if((currMillis - prevMillis) >= interval) {
     prevMillis = currMillis;
-    Serial.printf("Free heap: %d bytes\n", ESP.getFreeHeap());
+    Serial.printf("[%l]Free heap: %d bytes\n", currMillis, ESP.getFreeHeap());
 
     if(globalErrorCounter >= 5) {
       ESP.restart();
