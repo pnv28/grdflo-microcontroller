@@ -51,7 +51,7 @@ void loop() {
     }
   }
 
-  if((currMillis - WiFiDiconnectSince) >= 180000 && WiFi.status() != WL_CONNECTED) {
+  if (WiFiDisconnectSince != 0 && (currMillis - WiFiDisconnectSince) >= 180000) {
     statusHandler(STATE_ERROR);
     ESP.restart();
   }

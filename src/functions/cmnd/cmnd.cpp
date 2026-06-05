@@ -16,6 +16,7 @@ void cmnd(char *segment[], const size_t seg_len, const char *payload) {
     int status = -1;
 
     if(strcmp(segment[2], "charger") == 0) {
+        if(strcmp(segment[1], "all") == 0) return;
         if(seg_len >= 5 && strcmp(segment[4], "cycle") == 0) {
             if(atoi(payload) < 1) {
                 status = -1;

@@ -7,6 +7,7 @@
 #define RED_PIN 21
 #define BLUE_PIN 21 // i know it is bricked
 
+#define FW_VERSION 1.0
 
 // Max Segment
 #define MAX_SEGMENT 6

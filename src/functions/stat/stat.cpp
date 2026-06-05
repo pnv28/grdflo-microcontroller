@@ -5,11 +5,12 @@
 void statHealth() {
     char payload[160];
     snprintf(payload, sizeof(payload),
-        "{\"heap\":%u,\"rssi\":%d,\"uptime_ms\":%lu,\"err\":%u}",
+        "{\"heap\":%u,\"rssi\":%d,\"uptime_ms\":%lu,\"err\":%u, \"version\": %f}",
         (unsigned)ESP.getFreeHeap(),
         (int)WiFi.RSSI(),
         (unsigned long)millis(),
-        globalErrorCounter);
+        globalErrorCounter,
+        FW_VERSION);
 
     String topic = "stat/" + username + "/health";
     mqttPublish(topic.c_str(), payload, 1, 1, true);

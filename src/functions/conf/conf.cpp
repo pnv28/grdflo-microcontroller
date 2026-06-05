@@ -2,15 +2,6 @@
 #include "functions/stat/stat.h"
 #include <Preferences.h>
 
-/*
-seg[0] = conf, seg[1] = device id, seg[2] = subcommand.
-
-subcommands:
-  health                                  -> publish stat/<dev>/health
-  state                                   -> publish stat/<dev>/state
-  edit/<namespace>/<key>  payload=<value> -> NVS write, then stat/<dev>/ack
-*/
-
 void conf(char *segment[], const size_t seg_len, const char *payload) {
     if(seg_len < 3) return;
     if(strcmp(segment[1], "all") == 0) return;
@@ -38,8 +29,7 @@ void conf(char *segment[], const size_t seg_len, const char *payload) {
         if(strcmp(segment[3], "creds") == 0) {
             pref.begin("creds", false);
             if(pref.isKey(segment[4])) {
-                pref.putString(segment[4], payload);
-                ok = true;
+                ok = (pref.putString(segment[4], payload) > 0);
             }
             pref.end();
         }

@@ -110,6 +110,8 @@ void getDeviceSpecificConfig() {
         }
 
         pinMode(lightPin[i], OUTPUT);
+        digitalWrite(lightPin[i], LOW);
+
 
         i++;
     }
