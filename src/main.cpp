@@ -53,7 +53,7 @@ void loop() {
 
   if((currMillis - prevMillis) >= interval) {
     prevMillis = currMillis;
-    Serial.printf("[%l]Free heap: %d bytes\n", currMillis, ESP.getFreeHeap());
+    Serial.printf("[%lu]Free heap: %d bytes\n", currMillis, ESP.getFreeHeap());
 
     if(globalErrorCounter >= 5) {
       ESP.restart();

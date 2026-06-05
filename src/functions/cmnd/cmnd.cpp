@@ -3,7 +3,7 @@
 #include "functions/stat/stat.h"
 
 int light(int lightID, bool state);
-int cycle(unsigned int timeInSeconds, char *segment[]);
+int cycle(unsigned long timeInSeconds, char *segment[]);
 
 int cycleID = 0;
 unsigned long cycleInterval = 0;
@@ -17,6 +17,10 @@ void cmnd(char *segment[], const size_t seg_len, const char *payload) {
 
     if(strcmp(segment[2], "charger") == 0) {
         if(seg_len >= 5 && strcmp(segment[4], "cycle") == 0) {
+            if(atoi(payload) < 1) {
+                status = -1;
+                return;
+            }
             status = cycle(atoi(payload), segment);
         } else if(seg_len >= 4) {
             status = charger(atoi(segment[3]), atoi(payload));
@@ -45,8 +49,8 @@ void cmnd(char *segment[], const size_t seg_len, const char *payload) {
 
 int charger(int chargerID, bool state) {
 
-    if(chargerID >= pinOffset) {
-        Serial.println("ChargerID can not be greater than pinOffset");
+    if(chargerID >= pinOffset || chargerID < 0) {
+        Serial.println("ChargerID OutOfBound");
         return -1;
     }
 
@@ -65,8 +69,8 @@ int charger(int chargerID, bool state) {
 
 int light(int lightID, bool state) {
 
-    if(lightID >= (totalPins-pinOffset)) {
-        Serial.println("PinID can not be greater than totalPins-pinOffset");
+    if(lightID >= (totalPins-pinOffset) || lightID < 0) {
+        Serial.println("PinID OutOfBound");
         return -1;
     }
 
@@ -83,7 +87,7 @@ int light(int lightID, bool state) {
     return 0;
 }
 
-int cycle(unsigned int timeInSeconds, char *segment[]) {
+int cycle(unsigned long timeInSeconds, char *segment[]) {
     int chargerID = atoi(segment[3]);
     int s = charger(chargerID, false);
     if (s != 0) return s;

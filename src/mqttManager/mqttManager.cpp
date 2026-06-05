@@ -19,7 +19,8 @@ static void mqtt_event_handler(void* handler_args, esp_event_base_t base, int32_
   switch ((esp_mqtt_event_id_t) event_id) {
     case MQTT_EVENT_CONNECTED: {
       Serial.println("Connected to GridFlow EMQX Server");
-      esp_mqtt_client_enqueue(client, testTopic, "GF-KD1-Test --> Online", 0, 0, 0, true);
+      String onlineMessageTopic = "stat/" + username + "/onoff";
+      esp_mqtt_client_enqueue(client, onlineMessageTopic.c_str(), "{\"status\": \"online\"}", 0, 2, 1, true);
       String cmndTopic = "cmnd/" + username + "/#";
       esp_mqtt_client_subscribe(client, cmndTopic.c_str(), 2);
       String confTopic = "conf/" + username + "/#";
@@ -108,12 +109,12 @@ void initMqtt() {
   mqtt_cfg.credentials.authentication.password = password.c_str();
   mqtt_cfg.broker.verification.certificate = ca_cert;
   
-  // ---- Last Will — uncomment for the real device ----
-  // mqtt_cfg.session.last_will.topic   = "test";
-  // mqtt_cfg.session.last_will.msg     = "{\"status\":\"offline\"}";
-  // mqtt_cfg.session.last_will.msg_len = 0;   // 0 -> strlen
-  // mqtt_cfg.session.last_will.qos     = 1;
-  // mqtt_cfg.session.last_will.retain  = 1;
+  static String lastWillTopic = "stat/" + username + "/onoff";
+  mqtt_cfg.session.last_will.topic   = lastWillTopic.c_str();
+  mqtt_cfg.session.last_will.msg     = "{\"status\": \"offline\"}";
+  mqtt_cfg.session.last_will.msg_len = 0;
+  mqtt_cfg.session.last_will.qos     = 2;
+  mqtt_cfg.session.last_will.retain  = 1;
 
   client = esp_mqtt_client_init(&mqtt_cfg);
   if(client == NULL) {

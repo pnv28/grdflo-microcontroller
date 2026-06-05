@@ -27,7 +27,6 @@ const char* ca_cert = "-----BEGIN CERTIFICATE-----\n"
 // unsigned int globalErrorCount = 0;
 
 const char* brokerUri = "mqtts://emqx.internal.grdflo.com:8883";
-const char* testTopic = "test";
 
 
 // Stuff which will be puleld from NVS

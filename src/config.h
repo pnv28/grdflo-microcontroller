@@ -20,7 +20,6 @@ extern  String ssid;
 extern  String wifiPassword;
 
 extern const char* brokerUri;
-extern const char* testTopic;
 extern  String username;
 extern  String password;
 
