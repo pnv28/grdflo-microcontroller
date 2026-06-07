@@ -5,9 +5,9 @@ drives a bank of relays (chargers + lights) over MQTT-TLS. The device pulls
 its identity, WiFi credentials, broker credentials, and pin map from NVS at
 boot, then connects to an EMQX broker and listens for routed commands.
 
-> If you are looking for a high-level "what should be changed" list, see
-> [`IMPROVEMENTS.md`](IMPROVEMENTS.md). This document describes **what the code
-> does today**, verified file-by-file.
+> This document describes **what the code does today**, verified
+> file-by-file. Open issues / open follow-ups are summarised in
+> [Known limitations / TODOs](#known-limitations--todos).
 
 ---
 
@@ -49,10 +49,16 @@ Each device is a single ESP32-C3 module that:
 - Drives two GPIO classes — **chargers** (relay-controlled DC charge ports)
   and **lights** — addressed by zero-based channel index.
 - Acknowledges every actioned command back on `stat/<dev_id>/ack`.
-- Reports health / relay state on demand on `stat/<dev_id>/health` and
-  `stat/<dev_id>/state`.
-- Self-heals: after five unacknowledged MQTT errors between 60-second heartbeats
-  the device reboots itself.
+- Reports health and relay state on the 60 s heartbeat, and on demand on
+  `stat/<dev_id>/health` and `stat/<dev_id>/state`.
+- Publishes an `{"status":"online"}` boot announce on
+  `stat/<dev_id>/onoff` and registers a retained `{"status":"offline"}`
+  **Last Will** on the same topic so abrupt power loss is observable
+  cloud-side.
+- Self-heals via three independent paths: (a) five MQTT errors in a
+  single heartbeat window force `ESP.restart()`; (b) WiFi disconnected
+  for ≥ 3 minutes forces `ESP.restart()`; (c) the 30 s task watchdog
+  panics a wedged `loop()`.
 
 There is no `setup`-time AP, no captive portal, and no OTA. Devices are
 **factory-provisioned** by flashing a pre-built NVS partition image generated
@@ -87,6 +93,13 @@ platform) because it tracks newer ESP-IDF releases. No third-party
 `bblanchon/ArduinoJson` pin was removed once it became clear that all
 `stat/` payloads are small, fixed-shape strings built directly via
 `snprintf` (see [`stat/` outgoing status messages](#stat--outgoing-status-messages)).
+
+### Firmware version
+
+`config.h` defines `FW_VERSION` (currently `1.0`) as a compile-time
+constant. The value is embedded in every `stat/<dev>/health` payload so
+the cloud can fingerprint the deployed firmware revision per device
+without a separate identity probe.
 
 ### Relay contact logic (wiring polarity)
 
@@ -155,7 +168,6 @@ into the `cmnd/` and `conf/` handlers synchronously.
 grdflo-microcontroller/
 ├── platformio.ini             # PIO env definition
 ├── DOCUMENTATION.md           # this file
-├── IMPROVEMENTS.md            # ranked review of known issues / TODOs
 ├── nvs.csv                    # NVS provisioning input (device-specific)
 ├── nvs.bin                    # NVS binary (generated; not committed)
 ├── nvs_partition_gen.py       # Espressif's NVS-image generator (vendored)
@@ -225,42 +237,62 @@ sequenceDiagram
         Cfg->>Boot: ESP.restart() after 5 s
     end
     Cfg->>Cfg: pinMode(chargerPin[i], OUTPUT) + digitalWrite(HIGH)
-    Cfg->>Cfg: pinMode(lightPin[i], OUTPUT)
+    Cfg->>Cfg: pinMode(lightPin[i], OUTPUT) + digitalWrite(LOW)
     Setup->>Setup: delay(3000)
     Setup->>Wifi: initWiFiConnection(ssid, pass)
     Wifi->>LED: STATE_WIFI_CONNECTING
     Wifi-->>Setup: connected (or reboot after 20 attempts)
-    Setup->>Mqtt: initMqtt()
+    Setup->>Mqtt: initMqtt() (LWT armed: stat/<dev>/onoff offline)
     Mqtt->>LED: STATE_MQTT_CONNECTING
     Mqtt->>Broker: TLS handshake + CONNECT
     Broker-->>Mqtt: CONNACK
     Mqtt->>LED: STATE_ALL_IS_WELL
-    Mqtt->>Broker: publish "test" / SUBSCRIBE cmnd|conf|cmnd/all
+    Mqtt->>Broker: publish stat/<dev>/onoff "online" / SUBSCRIBE cmnd|conf|cmnd/all (QoS 1)
 ```
 
 Concrete order in `setup()` ([`src/main.cpp`](src/main.cpp:24)):
 
-1. `statusHandler(STATE_BOOT)`
-2. `Serial.begin(115200)`
-3. `pinMode(RED_PIN, OUTPUT)` / `pinMode(BLUE_PIN, OUTPUT)` — both pins are
-   `21`, which the in-source comment marks as bricked (see "Known limitations").
-4. Watchdog: reconfigure to 30 s with panic, subscribe the current task.
+1. `statusHandler(STATE_BOOT)`.
+2. `Serial.begin(115200)`.
+3. `Serial.printf("BOOT TIME FREE HEAP: %d\n", ESP.getFreeHeap());` —
+   first thing on the serial after the bootloader, makes it easy to spot
+   memory regressions across firmware revisions.
+4. Watchdog: `esp_task_wdt_reconfigure(&wdt_cfg)` (30 s, panic on
+   timeout) then `esp_task_wdt_add(NULL)` to subscribe the current task.
 5. `getDeviceSpecificConfig()` — reads NVS, allocates `chargerPin[]`,
-   `lightPin[]`, `relayState[]`.
-6. `delay(3000)` — held over from earlier testing (the in-code comment says
-   "waiting for everything to initialise").
+   `lightPin[]`, `relayState[]`, drives boot-time charger HIGH and light
+   LOW.
+6. `delay(3000)` — wait for "all components to initialise, mainly WiFi
+   related hardware, such that when we try to connect everything is on
+   and running" (per the in-source comment, updated from the older
+   "earlier testing" wording).
 7. `initWiFiConnection(ssid.c_str(), wifiPassword.c_str())`.
 8. `initMqtt()`.
 
+Note: there are **no** `pinMode(RED_PIN, OUTPUT)` /
+`pinMode(BLUE_PIN, OUTPUT)` calls in current `setup()` — the RED / BLUE
+GPIOs are defined in `config.h` but never configured or written by any
+runtime code path, consistent with the in-source `// i know it is
+bricked` comment on `BLUE_PIN`.
+
 Boot-time chargers are forced HIGH (`digitalWrite(chargerPin[i], HIGH)` in
-`config.cpp:94`); lights are configured as `OUTPUT` but **not** forced to a
-state, so they sit at whatever level the GPIO settles at after reset
-(Arduino's `pinMode(..., OUTPUT)` default is LOW).
+`config.cpp:93`); lights are forced LOW
+(`digitalWrite(lightPin[i], LOW)` in `config.cpp:113`). Both are
+explicit — no relay channel is left at the GPIO's reset-time default.
+Combined with the active-low wiring polarity:
+
+- chargers boot **into the NC contact** (relay coil de-energised → load
+  in its default-on state, the safe default for in-progress chargers
+  surviving a device reboot)
+- lights boot **into the NO contact** (relay coil de-energised → load
+  off, the safe default for unattended illumination)
 
 `relayState[]` is value-initialised to zero by `new int[totalPins]()`,
 then the charger-init loop sets `relayState[i] = 1` for each charger
-immediately after `digitalWrite(chargerPin[i], HIGH)` so the in-memory
-mirror matches the actual electrical state from boot.
+immediately after `digitalWrite(chargerPin[i], HIGH)`. Light entries
+stay at the value-initialised `0`, which already matches the
+`digitalWrite(lightPin[i], LOW)` electrical state, so the in-memory
+mirror is consistent across both groups from boot.
 
 ---
 
@@ -345,15 +377,16 @@ levels — `statState()` then reads the mirror without having to
 | Symbol | Source | Used by |
 | ------ | ------ | ------- |
 | `RED_PIN`, `BLUE_PIN` | `#define` (both `21`) | `main.cpp` (`pinMode` only) |
+| `FW_VERSION` | `#define 1.0` | `stat.cpp::statHealth()` — embedded in every health payload |
 | `MAX_SEGMENT` | `#define 6` | `mqttManager.cpp` topic tokeniser — upper bound on `/`-split tokens. The longest currently-routed form (`cmnd/<dev>/charger/<id>/cycle`) is 5 segments, so 6 leaves one slot of headroom |
 | `ca_cert` | static literal | `mqttManager.cpp` (TLS) |
 | `brokerUri` | static literal `mqtts://emqx.internal.grdflo.com:8883` | `mqttManager.cpp` |
-| `testTopic` | static literal `"test"` | `mqttManager.cpp` (online announce only) |
 | `ssid`, `wifiPassword`, `username`, `password` | NVS `creds` | WiFi + MQTT init |
 | `pinOffset`, `totalPins` | NVS `pinDistribution` | All channel math |
 | `chargerPin[]`, `lightPin[]`, `relayState[]` | Heap-allocated in `config.cpp` | `cmnd/`, `stat/` |
 | `cycleID`, `cycleInterval`, `cycleStart`, `cycleFlag` | Set by `cycle()` in `cmnd.cpp`; read in `loop()` | Timed charger re-enable |
 | `globalErrorCounter` | `mqttManager.cpp` (incremented in `MQTT_EVENT_ERROR`; reset in `MQTT_EVENT_CONNECTED`) | Reboot trigger in `loop()` |
+| `WiFiDisconnectSince` | `checkWiFiStatus.cpp` (timestamp on first loss; cleared when reconnected) | 3-minute WiFi-loss reboot trigger in `loop()` |
 
 ---
 
@@ -383,12 +416,25 @@ directly — not Arduino PubSubClient. The native client supports MQTT
 QoS 0/1/2, TLS out of the box, a persistent outbox, and runs on its own
 FreeRTOS task. Key design choices in `initMqtt()`:
 
-- **`keepalive = 20` s.** Client sends `PINGREQ` every 20 s of
+- **`keepalive = 30` s.** Client sends `PINGREQ` every 30 s of
   inactivity; broker disconnects a silent client after
-  `keepalive × 1.5 = 30 s`. This **deliberately aligns** with the 30 s
-  task watchdog timeout — if `loop()` wedges, the broker notices at
-  roughly the same moment the watchdog fires, so an offline device shows
-  up cloud-side without manual coordination.
+  `keepalive × 1.5 = 45 s`. A 30 s keepalive is the practical lower
+  bound under TLS on a flaky upstream — anything shorter risks the
+  client spending a meaningful share of its time on ping handshakes
+  instead of payload traffic. The 30 s task watchdog still fires before
+  the broker times the device out, so a wedged `loop()` resets locally
+  and the LWT publishes the offline state cloud-side after the
+  subsequent broker timeout.
+- **Last Will (LWT) enabled.** `mqtt_cfg.session.last_will.topic` is
+  set to `stat/<dev>/onoff` with payload `{"status": "offline"}`,
+  QoS 2, **retained**. The broker stores this and re-emits it the
+  instant it concludes the client has gone away (TCP RST, keepalive
+  timeout, or unclean disconnect). The matching `{"status": "online"}`
+  publish at `MQTT_EVENT_CONNECTED` overwrites the retained value
+  cleanly on every healthy reconnect. The `lastWillTopic` `String` is
+  declared `static` inside `initMqtt()` because the IDF config struct
+  stores the raw `const char *`, not a copy — a stack-local would
+  dangle the instant `initMqtt()` returns.
 - **TLS via `ca_cert`.** The embedded `GridFlow-RootCA` PEM is passed to
   the ESP-IDF TLS stack as `broker.verification.certificate`. The stack
   verifies the broker's certificate chain against this CA; verification
@@ -404,30 +450,60 @@ FreeRTOS task. Key design choices in `initMqtt()`:
 
 | Topic filter         | QoS | Purpose |
 | -------------------- | --- | ------- |
-| `cmnd/<dev_id>/#`    | 2   | Actionable commands targeted at this device |
-| `conf/<dev_id>/#`    | 2   | Runtime config (NVS edits, health/state requests, reboot) |
-| `cmnd/all/#`         | 2   | Broadcast `cmnd` — every device on the broker receives this |
+| `cmnd/<dev_id>/#`    | 1   | Actionable commands targeted at this device |
+| `conf/<dev_id>/#`    | 1   | Runtime config (NVS edits, health/state requests, reboot) |
+| `cmnd/all/#`         | 1   | Broadcast `cmnd` — every device on the broker receives this |
 
 `<dev_id>` is the `username` string read from NVS (`dev_id` in the `creds`
 namespace).
 
+QoS for all three subscriptions was lowered from 2 to 1 in current
+firmware: relay-control traffic is idempotent within the actuator's
+acceptable error margin (commanding ON twice is identical to commanding
+ON once), so the at-most-once duplicate suppression of QoS 2's PUBREC /
+PUBREL handshake does not buy anything operationally, and the round
+trips it adds matter on a slow upstream.
+
 ### Published
 
-| Topic                  | Producer          | QoS | retain | When |
-| ---------------------- | ----------------- | --- | ------ | ---- |
-| `test`                 | `MQTT_EVENT_CONNECTED` | 0 | 0 | Single boot-announce ("`GF-KD1-Test --> Online`", hardcoded — see IMPROVEMENTS #16/#26) |
-| `stat/<dev_id>/ack`    | `statAck()`        | 2  | 0 | After every actioned `cmnd/` or `conf/edit/...` topic |
-| `stat/<dev_id>/health` | `statHealth()`     | 2  | 1 | (a) every 60 s heartbeat in `loop()`; (b) on `conf/<dev_id>/health` request |
-| `stat/<dev_id>/state`  | `statState()`     | 2  | 1 | On `conf/<dev_id>/state` request |
+| Topic                    | Producer               | QoS | retain | When |
+| ------------------------ | ---------------------- | --- | ------ | ---- |
+| `stat/<dev_id>/onoff`    | `MQTT_EVENT_CONNECTED` | 2   | 1      | Single boot/reconnect announce: `{"status": "online"}` |
+| `stat/<dev_id>/onoff`    | broker (Last Will)     | 2   | 1      | Re-emitted by broker on unclean disconnect: `{"status": "offline"}` |
+| `stat/<dev_id>/ack`      | `statAck()`            | 1   | 0      | After every actioned `cmnd/` or `conf/edit/...` topic |
+| `stat/<dev_id>/health`   | `statHealth()`         | 1   | 1      | (a) every 60 s heartbeat in `loop()`; (b) on `conf/<dev_id>/health` request |
+| `stat/<dev_id>/state`    | `statState()`          | 1   | 1      | (a) every 60 s heartbeat in `loop()`; (b) on `conf/<dev_id>/state` request |
+
+The `stat/<dev_id>/onoff` topic is the **device-presence channel**: the
+broker holds the latest retained value on it, so any subscriber sees the
+device's current up/down state on join without waiting for the next
+heartbeat. The boot publish (QoS 2, retained) is symmetric with the LWT
+so the topic always carries a current truth.
 
 The `tele/` namespace is **planned** but not yet emitted; only the header
 `functions/tele/tele.h` exists.
 
 ### Topic parsing
 
-Inside `MQTT_EVENT_DATA` ([`src/mqttManager/mqttManager.cpp:42`](src/mqttManager/mqttManager.cpp:42)),
-the incoming topic is split on `/` into at most `MAX_SEGMENT = 6` tokens
-using `strtok_r`. The router enforces:
+Inside `MQTT_EVENT_DATA` ([`src/mqttManager/mqttManager.cpp:43`](src/mqttManager/mqttManager.cpp:43)),
+two upfront guards short-circuit malformed events **before** any copy or
+tokenisation happens:
+
+1. **Fragmented payload guard.** If
+   `event->current_data_offset != 0` or
+   `event->data_len != event->total_data_len`, the event represents only
+   one fragment of a larger MQTT publish and is dropped (logged
+   `"Fragmented MQTT message --> dropping"`). The router does not
+   currently reassemble fragments — see [Known limitations](#known-limitations--todos).
+2. **Oversize guard.** If `event->topic_len > 256` or
+   `event->data_len > 256`, the event is dropped
+   (`"Oversized topic or message length --> dropping"`). This is a
+   defence against pathological payloads exhausting the VLA-based local
+   buffers that the parser uses (`char topic[event->topic_len + 1]` and
+   `char payload[event->data_len + 1]`).
+
+After both guards, the incoming topic is split on `/` into at most
+`MAX_SEGMENT = 6` tokens using `strtok_r`. The router enforces:
 
 1. `tokenCount >= 3` — else the message is silently dropped. Every valid
    routable topic has at least 3 segments (`<root>/<dev>/<sub>`), so this
@@ -454,14 +530,19 @@ using `strtok_r`. The router enforces:
 and payload into local stack arrays and appends `'\0'` manually. The
 initial `Serial.printf` avoids that copy by using `%.*s` (explicit
 length). Both copies are variable-length stack arrays (VLAs) — fine as
-a GCC extension but fragile under large MQTT payloads.
+a GCC extension but bounded to ≤ 256 bytes each by the oversize guard
+above so stack pressure is predictable.
 
 ```mermaid
 flowchart LR
-    A["MQTT_EVENT_DATA"] --> B["copy topic + payload to local buffers"]
+    A["MQTT_EVENT_DATA"] --> Z{"fragmented?"}
+    Z -- yes --> X1["drop"]
+    Z -- no --> Z2{"topic_len > 256 OR data_len > 256?"}
+    Z2 -- yes --> X2["drop"]
+    Z2 -- no --> B["copy topic + payload to local VLAs"]
     B --> C["strtok_r on '/'"]
     C --> D{"tokenCount >= 3?"}
-    D -- no --> X["drop"]
+    D -- no --> X3["drop"]
     D -- yes --> E{"segment[1] == username?"}
     E -- no --> F{"segment[1] == 'all'?"}
     F -- no --> Y["log 'Client ID Mismatch'"]
@@ -471,8 +552,11 @@ flowchart LR
     G -->|"conf"| I["conf()"]
 ```
 
-> Note: fragmented messages are **not** detected; each `MQTT_EVENT_DATA`
-> chunk is currently treated as a complete payload. See IMPROVEMENTS #22.
+> Note: fragmented payloads are now **explicitly dropped** rather than
+> mis-treated as complete — but the router does not reassemble them.
+> Senders must keep individual publishes under the broker / TLS
+> fragmentation threshold (which, for the topic shapes this firmware
+> uses, is well under any path MTU concern).
 
 ### Operator cheat sheet — sample topics & payloads
 
@@ -485,15 +569,17 @@ For a device with `dev_id = GF-B1`, `totalPins = 4`, `pinOffset = 2`
 | `cmnd/GF-B1/charger/1` | `"0"` | cloud → device | Charger 1 OFF (LOW → NO contact, coil energised) |
 | `cmnd/GF-B1/light/0` | `"1"` | cloud → device | Light 0 ON |
 | `cmnd/GF-B1/light/all` | `"0"` | cloud → device | Every light channel on **this device** OFF |
-| `cmnd/GF-B1/charger/0/cycle` | `"5"` | cloud → device | Charger 0 OFF immediately, ON again 5 s later |
+| `cmnd/GF-B1/charger/0/cycle` | `"30"` | cloud → device | Charger 0 OFF immediately, ON again 30 s later (payload **must be > 5 s** — see `cmnd/charger/cycle` below) |
 | `cmnd/all/light/all` | `"1"` | cloud → **every device** | Fleet broadcast: every device turns all lights ON |
 | `cmnd/all/light/0` | `"0"` | cloud → **every device** | Every device turns its light index 0 OFF |
+| `cmnd/all/charger/...` | (any) | cloud → device | **Explicitly refused** by `cmnd()` — charger broadcasts are not supported |
 | `conf/GF-B1/health` | (ignored) | cloud → device | Force an out-of-cycle `stat/GF-B1/health` publish |
 | `conf/GF-B1/state` | (ignored) | cloud → device | Force a `stat/GF-B1/state` snapshot publish |
-| `conf/GF-B1/reboot` | (ignored) | cloud → device | `ESP.restart()` — no ack (the next "Online" publish from `MQTT_EVENT_CONNECTED` is the indirect confirmation) |
-| `conf/GF-B1/edit/creds/wifi_pass` | `"NewPassw0rd"` | cloud → device | NVS write; takes effect on next reboot — pair with `conf/GF-B1/reboot` |
-| `stat/GF-B1/health` | `{"heap":234560,"rssi":-52,"uptime_ms":873912,"err":0}` | device → cloud (retained) | 60 s heartbeat or response to `conf/<>/health` |
-| `stat/GF-B1/state` | `{"chargers":[0,1],"lights":[1,0]}` | device → cloud (retained) | Response to `conf/<>/state` |
+| `conf/GF-B1/reboot` | (ignored) | cloud → device | `ESP.restart()` — no ack (the next `stat/<dev>/onoff` `"online"` publish from `MQTT_EVENT_CONNECTED` is the indirect confirmation) |
+| `conf/GF-B1/edit/creds/wifi_pass` | `"NewPassw0rd"` | cloud → device | NVS write; takes effect on next reboot — pair with `conf/GF-B1/reboot`. Ack `ok` mirrors the NVS `putString` return |
+| `stat/GF-B1/onoff` | `{"status": "online"}` / `{"status": "offline"}` | device → cloud (retained, QoS 2) | Presence beacon (boot publish vs broker-emitted LWT) |
+| `stat/GF-B1/health` | `{"heap":234560,"rssi":-52,"uptime_ms":873912,"err":0, "version": 1.000000}` | device → cloud (retained) | 60 s heartbeat or response to `conf/<>/health` |
+| `stat/GF-B1/state` | `{"chargers":[0,1],"lights":[1,0]}` | device → cloud (retained) | 60 s heartbeat or response to `conf/<>/state` |
 | `stat/GF-B1/ack` | `{"topic":"cmnd/GF-B1/charger/1","ok":true,"t":873912}` | device → cloud | Sent after every actioned `cmnd/` or `conf/edit/...` |
 
 Payload semantics: numeric only. The handler uses `atoi()`, so only the
@@ -503,6 +589,10 @@ literal `"1"` turns a relay ON; `"on"` / `"ON"` / `"true"` all parse as
 > `conf/all/...` is **explicitly refused** by the handler — broadcasts may
 > only carry `cmnd/` actions, never `conf/` ones. Issuing
 > `conf/all/reboot` would be a fleet-wide footgun.
+>
+> `cmnd/all/charger/...` is also explicitly refused inside the `cmnd()`
+> handler. Fleet broadcasts cover lights only; chargers must always be
+> addressed individually.
 
 ---
 
@@ -524,25 +614,44 @@ enforced this). It then dispatches on `segment[2]`:
 
 ### `cmnd/<dev_id>/charger/<chargerID>` — single-channel toggle
 
+**Broadcast guard.** The very first check inside the `charger` branch is
+`if (strcmp(segment[1], "all") == 0) return;` — fleet-broadcast charger
+commands are explicitly refused (no GPIO write, no ack). Only the
+addressed-device form is honoured.
+
 Payload is parsed by `atoi(payload)`: `"1"` → ON, `"0"` (or anything that
 `atoi` parses to non-1) → OFF. The branch requires `seg_len >= 4`; otherwise
 the call is silently dropped (no ack).
 
 `charger(chargerID, state)`:
 
-- Range check: `chargerID >= pinOffset` → return `-1`, no GPIO write.
+- Range check: `chargerID >= pinOffset || chargerID < 0` → return `-1`,
+  no GPIO write. Both bounds are checked — negative IDs (e.g. an
+  un-parsed `atoi` failure that returned `0` is still in range, but any
+  explicit `"-1"` would be rejected) and out-of-range positive IDs are
+  symmetric.
 - ON: `digitalWrite(chargerPin[chargerID], HIGH)`, `relayState[chargerID] = 1`.
 - OFF: `digitalWrite(chargerPin[chargerID], LOW)`, `relayState[chargerID] = 0`.
-
-> The lower-bound check (negative `chargerID`) is missing; see IMPROVEMENTS #20.
 
 ### `cmnd/<dev_id>/charger/<chargerID>/cycle` — timed re-enable
 
 Topic shape: `cmnd/<dev_id>/charger/<chargerID>/cycle` (`seg_len >= 5` and
 `segment[4] == "cycle"`).
 
-Payload: integer seconds. `cycle()` immediately turns the charger OFF
-(via `charger(chargerID, false)` — if that returns non-zero, e.g. for an
+Payload: integer seconds, `unsigned long`-wide (the `cycle()` signature
+is `int cycle(unsigned long timeInSeconds, char *segment[])`, so very
+long durations no longer overflow `unsigned int`).
+
+**Minimum cycle duration is enforced.** Before invoking `cycle()`, the
+dispatcher checks `atoi(payload) <= 5` and **bails silently** (no GPIO
+write, no ack) if the requested duration is 5 seconds or shorter. The
+floor exists so an accidental tiny cycle (e.g. `0`, `1`, the empty
+string parsing to `0`) cannot rapidly re-toggle a power contactor —
+sub-5-second relay flips are mechanically abusive and the de-bounce on
+the cloud side is not always reliable.
+
+On a valid call, `cycle()` immediately turns the charger OFF (via
+`charger(chargerID, false)` — if that returns non-zero, e.g. for an
 out-of-range `chargerID`, `cycle()` returns early with that status and
 the eventual ack is `ok:false`). On success it sets `cycleFlag = true`,
 `cycleID = chargerID`, `cycleInterval = payload * 1000`,
@@ -568,7 +677,8 @@ not match the dispatch.
 
 Same payload contract as charger. `light(lightID, state)`:
 
-- Range check: `lightID >= (totalPins - pinOffset)` → return `-1`.
+- Range check: `lightID >= (totalPins - pinOffset) || lightID < 0` →
+  return `-1`. Both bounds, symmetric with `charger()`.
 - Writes `lightPin[lightID]` and mirrors into `relayState[pinOffset + lightID]`.
 
 ### `cmnd/all/light` or `cmnd/<dev_id>/light/all` — broadcast light
@@ -594,7 +704,7 @@ confirm topics we silently dropped.
   empty string and `"on"`/`"off"`).
 
 > The `"on"`/`"off"` / `"true"`/`"false"` quirk is an open issue — see
-> IMPROVEMENTS #21.
+> [Known limitations](#known-limitations--todos).
 
 ---
 
@@ -626,9 +736,13 @@ Dispatch on `segment[2]`:
 ### Edit semantics
 
 `conf/edit/...` accepts `seg_len >= 5` (i.e. namespace + key are present).
-The handler opens NVS read-write on the named namespace, **only** if the key
-already exists (`pref.isKey(segment[4])`) writes the new string value and
-sets `ok = true`. Acks via `statAck(segment, seg_len, ok)`. So:
+The handler opens NVS read-write on the named namespace, and **only** if
+the key already exists (`pref.isKey(segment[4])`) writes the new string
+value. The ack flag is now derived from `Preferences::putString`'s
+return — `ok = (pref.putString(...) > 0)`. So an NVS write that didn't
+actually persist any bytes (out-of-space, hardware failure) acks
+`ok:false` instead of silently lying. Acks via
+`statAck(segment, seg_len, ok)`. So:
 
 - Adding a brand-new key over MQTT is **not** supported — the `isKey()`
   guard exists specifically to prevent accidentally creating arbitrary
@@ -641,9 +755,9 @@ sets `ok = true`. Acks via `statAck(segment, seg_len, ok)`. So:
   `conf/<dev>/edit/creds/wifi_pass` with a `conf/<dev>/reboot`.
 
 Example: publishing `"NewPassword"` to `conf/GF-B1/edit/creds/wifi_pass`
-rewrites the NVS key and acks; the new password is live after the
-operator publishes `conf/GF-B1/reboot` (or the device reboots for any
-other reason).
+rewrites the NVS key and acks `ok:true` (assuming the write succeeded);
+the new password is live after the operator publishes
+`conf/GF-B1/reboot` (or the device reboots for any other reason).
 
 > **Broker ACL security note.** `conf/<dev>/edit/#` can rewrite WiFi
 > credentials, MQTT password, and the device ID. The broker ACL on this
@@ -661,6 +775,18 @@ Implementation: [`src/functions/stat/stat.cpp`](src/functions/stat/stat.cpp).
 All `stat/` payloads are small fixed-shape JSON strings built directly with
 `snprintf` — there is no JSON library dependency.
 
+**QoS choice.** All three publishers (`statHealth`, `statState`,
+`statAck`) call `mqttPublish(..., QoS=1, ...)`. QoS 1 is "at least
+once"; duplicates may arrive on the subscriber side but the broker will
+not silently drop. Given the payloads are idempotent JSON snapshots or
+acks tagged with the original topic, the cloud subscriber can dedup
+cheaply, and we save the round trips that QoS 2's PUBREC/PUBREL
+handshake would otherwise add. The boot-announce on
+`stat/<dev>/onoff` and the LWT (broker-side) are the only QoS 2
+publishes — they're presence beacons, where double-publishing or
+out-of-order delivery would meaningfully muddy the cloud's view of
+device state.
+
 **Retain choices.** `stat/<dev>/health` and `stat/<dev>/state` are
 published with `retain=1` so a dashboard subscribing mid-stream
 immediately sees the latest snapshot without waiting for the next
@@ -668,18 +794,23 @@ periodic publish. `stat/<dev>/ack` is **not** retained — each ack
 describes a one-shot event in the past, so a freshly-subscribing client
 being greeted with an hour-old ack would be misleading.
 
-### `statHealth()` → `stat/<dev>/health` (QoS 2, retain)
+### `statHealth()` → `stat/<dev>/health` (QoS 1, retain)
 
 ```json
-{"heap":<freeHeapBytes>,"rssi":<dBm>,"uptime_ms":<millis()>,"err":<globalErrorCounter>}
+{"heap":<freeHeapBytes>,"rssi":<dBm>,"uptime_ms":<millis()>,"err":<globalErrorCounter>, "version": <FW_VERSION>}
 ```
+
+The `version` field is a `%f`-formatted print of the `FW_VERSION`
+compile-time macro (`1.0` today, rendered as `1.000000` because
+`snprintf` defaults `%f` to 6 decimal places). Subscribers should
+compare numerically rather than string-match.
 
 Called from two places:
 
 - `loop()` in `main.cpp` — every 60 s heartbeat.
 - `conf()` when `segment[2] == "health"`.
 
-### `statState()` → `stat/<dev>/state` (QoS 2, retain)
+### `statState()` → `stat/<dev>/state` (QoS 1, retain)
 
 ```json
 {"chargers":[<state_0>,<state_1>,...],"lights":[<state_0>,<state_1>,...]}
@@ -688,7 +819,17 @@ Called from two places:
 Each entry is `0` or `1`, mirroring `relayState[]`. The split point is
 `pinOffset`. Buffer is `char[256]` — comfortable for the 16-channel max.
 
-### `statAck()` → `stat/<dev>/ack` (QoS 2, retain=0, store=true)
+Called from two places:
+
+- `loop()` in `main.cpp` — every 60 s heartbeat (added in current
+  firmware; previously this was on-demand only). Pairing it with the
+  `statHealth()` tick gives the cloud an unsolicited relay-state
+  snapshot at the same cadence as health metrics, so a long-lived
+  dashboard does not need a separate poll to stay current after a
+  retained-payload TTL elapses.
+- `conf()` when `segment[2] == "state"`.
+
+### `statAck()` → `stat/<dev>/ack` (QoS 1, retain=0, store=true)
 
 Two overloads:
 
@@ -811,23 +952,38 @@ Runs once during `setup()` after NVS is read. Sequence:
 2. `WiFi.setAutoReconnect(true)`
 3. `WiFi.persistent(false)` — do not write credentials to internal flash
    (we already have them in NVS).
-4. `WiFi.begin(ssid, password)`
-5. Up to 20 retries of 500 ms each (≈10 s total).
-6. If still not connected: `statusHandler(STATE_ERROR)` + 5 s delay +
+4. `WiFi.setSleep(false)` — disable WiFi modem sleep. The C3's default
+   modem-sleep behaviour pauses the radio between beacon intervals to
+   save power; for an always-on mains-powered controller that
+   trade-off is the wrong way round — staying awake gives lower
+   latency on inbound MQTT publishes and reduces tail-latency spikes
+   on outbound publishes, at no meaningful current-draw cost.
+5. `WiFi.begin(ssid, password)`
+6. Up to 20 retries of 500 ms each (≈10 s total).
+7. If still not connected: `statusHandler(STATE_ERROR)` + 5 s delay +
    `ESP.restart()`.
-7. Otherwise: print local IP.
-
-> Currently `setAutoReconnect` / `persistent` are called *after* `WiFi.begin()`
-> in the source order in `setup()`'s call to `initWiFiConnection`. The
-> IMPROVEMENTS doc marks #4 as fixed — verify against current source if
-> behaviour seems off.
+8. Otherwise: print local IP.
 
 ### `checkWiFiStatus(ssid, password)` ([`src/wifiUtils/checkWiFiStatus.cpp`](src/wifiUtils/checkWiFiStatus.cpp))
 
-Called once per 60 s heartbeat from `loop()`. If `WiFi.status()` is no
-longer `WL_CONNECTED`, sets `STATE_WIFI_CONNECTING`, then issues
-`WiFi.disconnect()` followed by `WiFi.begin(ssid, password)`. (A lighter
-`WiFi.reconnect()` would also work — see IMPROVEMENTS #37.)
+Called once per 60 s heartbeat from `loop()`. Behaviour:
+
+- If `WiFi.status() != WL_CONNECTED`: set `STATE_WIFI_CONNECTING`,
+  log `"WiFi lost, reconnecting..."`, call `WiFi.reconnect()` (lighter
+  than the previous `WiFi.disconnect()` + `WiFi.begin(...)` because it
+  reuses the cached credentials from `setAutoReconnect`), and stamp
+  `WiFiDisconnectSince = millis()` **on the first observation only**
+  (subsequent calls while still disconnected do not move the
+  timestamp, so the watchdog measures the **total** disconnect
+  duration, not the time-since-last-check).
+- If `WiFi.status() == WL_CONNECTED`: clear
+  `WiFiDisconnectSince = 0` so the next disconnect starts a fresh
+  measurement.
+
+`WiFiDisconnectSince` is declared in `checkWiFiStatus.cpp` and exported
+via `wifiUtils.h`; `main.cpp::loop()` reads it on every iteration (not
+just the 60 s tick) to enforce the 3-minute reboot threshold described
+under [Watchdog & self-healing](#watchdog--self-healing).
 
 ---
 
@@ -842,12 +998,12 @@ the device. `trigger_panic = true` causes a full ESP32 panic — a register
 dump and stack trace are emitted on serial before the reset, which is
 invaluable for diagnosing the hang post-mortem.
 
-The 30 s WDT timeout intentionally matches the MQTT broker-side timeout
-of `keepalive (20s) × 1.5 = 30 s` — see
-[MQTT client configuration](#mqtt-client-configuration-design-notes).
-If the device hangs, the broker notices at roughly the same moment the
-WDT fires, so a hung device shows up cloud-side at the same time the
-device hard-resets.
+The 30 s WDT now fires **before** the 45 s broker-side keepalive
+timeout (`keepalive 30 s × 1.5`), so a wedged `loop()` resets locally
+first; the broker then observes the keepalive failure, emits the
+retained LWT on `stat/<dev>/onoff`, and the post-reboot device's
+boot-announce publish overwrites it. The cloud sees the offline → online
+edge cleanly even for hard hangs.
 
 ### Error-counter reboot
 
@@ -857,25 +1013,58 @@ device hard-resets.
 
 ```cpp
 if (globalErrorCounter >= 5) {
+    statusHandler(STATE_ERROR);
     ESP.restart();
 }
 ```
 
-So five MQTT error events in a single heartbeat window force a reboot. In
+So five MQTT error events in a single heartbeat window force a reboot.
+The explicit `statusHandler(STATE_ERROR)` immediately before
+`ESP.restart()` guarantees the LED reaches the error state for at least
+a brief moment even if some intervening transition repainted it (e.g.
+a fleeting `MQTT_EVENT_CONNECTED` between the disconnects). In
 practice this is the recovery path for "broker reachable but TLS/auth
 broken" failure modes.
+
+### WiFi-loss watchdog
+
+`loop()` checks `WiFiDisconnectSince` on **every iteration** (not just
+the heartbeat tick):
+
+```cpp
+if (WiFiDisconnectSince != 0 && (currMillis - WiFiDisconnectSince) >= 180000) {
+    statusHandler(STATE_ERROR);
+    ESP.restart();
+}
+```
+
+If the radio has been disconnected continuously for 3 minutes — long
+enough that the Arduino auto-reconnect plus per-heartbeat
+`WiFi.reconnect()` have both failed to recover the link — the device
+reboots. This is the recovery path for "AP/router momentarily flapped
+and Arduino's WiFi stack got stuck in a bad state" failure modes that
+the soft `WiFi.reconnect()` cannot break out of.
+
+`WiFiDisconnectSince` is set by `checkWiFiStatus()` on the first
+observation of a disconnect and cleared on reconnection (see
+[WiFi management](#wifi-management)), so the timer is honest about
+total disconnect duration even though `loop()` polls it more often than
+it is updated.
 
 ### Reboot points
 
 The device hard-reboots (`ESP.restart()`) in any of these conditions:
 
-- NVS `creds` read failure (`config.cpp:67`).
+- NVS `creds` read failure (`config.cpp:66`).
 - NVS `pinMapping` read returns `255` for any required channel
-  (`config.cpp:90`, `config.cpp:109`).
-- WiFi fails to associate within 20 attempts (`initWiFiConnection.cpp:20`).
-- `esp_mqtt_client_init()` returns `NULL` (`mqttManager.cpp:123`).
-- `globalErrorCounter >= 5` at the next 60 s tick (`main.cpp:60`).
-- Operator publishes `conf/<dev>/reboot` (`conf.cpp:29`).
+  (`config.cpp:89`, `config.cpp:109`).
+- WiFi fails to associate within 20 attempts during boot
+  (`initWiFiConnection.cpp:21`).
+- WiFi has been disconnected for ≥ 180 000 ms after boot
+  (`main.cpp:54`).
+- `esp_mqtt_client_init()` returns `NULL` (`mqttManager.cpp:132`).
+- `globalErrorCounter >= 5` at the next 60 s tick (`main.cpp:65`).
+- Operator publishes `conf/<dev>/reboot` (`conf.cpp:20`).
 
 ---
 
@@ -968,8 +1157,9 @@ esptool.py --port <serial-port> write_flash 0x9000 nvs.bin
 > unconditional at the top of the file, so install it regardless
 > (`pip install cryptography`).
 
-NVS is **not** currently encrypted in deployed devices — IMPROVEMENTS #15
-tracks this for future hardening.
+NVS is **not** currently encrypted in deployed devices — see
+[Known limitations](#known-limitations--todos) for the future-hardening
+note.
 
 ---
 
@@ -1070,7 +1260,7 @@ pio device monitor -b 115200
 1. Create `src/functions/tele/tele.cpp` and implement publishers (likely
    periodic from `loop()`, not driven by an incoming subscription).
 2. Decide whether the device should also *consume* `tele/...` — if so, add
-   it to the dispatch in `mqtt_event_handler` (`mqttManager.cpp:69`).
+   it to the dispatch in `mqtt_event_handler` (`mqttManager.cpp:78`).
 3. Wire any periodic publisher into the 60 s tick block in `loop()`.
 
 ### Add a new STATE_* LED state
@@ -1083,39 +1273,47 @@ pio device monitor -b 115200
 
 ## Known limitations / TODOs
 
-These are limitations of **the current code**, distinct from the
-forward-looking review in `IMPROVEMENTS.md`:
+These are limitations of **the current code**:
 
 - **`RED_PIN` and `BLUE_PIN` both set to GPIO 21** — the in-source comment
   in `config.h` reads "*i know it is bricked*" and "*i might have fried gpio
   pin 21*". The two `pinMode(..., OUTPUT)` calls in `setup()` configure the
   same physical pin twice; no code path actually drives RED/BLUE today.
-- **Online-announce is hardcoded.** The boot-time publish targets the
-  literal topic `"test"` with the literal payload `"GF-KD1-Test --> Online"`
-  regardless of `username`. IMPROVEMENTS #16 / #26 track this.
-- **No Last Will.** The LWT block in `initMqtt()` is commented out; the
-  broker has no way to detect a hard-powered-off device. IMPROVEMENTS #29.
 - **No NTP.** TLS certificate validity (`notBefore`/`notAfter`) is checked
   against an unsynced system clock, which on cold boot is at the epoch.
-  IMPROVEMENTS #30.
 - **Single-slot cycle.** A second `cycle` command overwrites the first
   without warning the operator. There is no per-channel queue, and no ack
-  for "cycle armed for X seconds" beyond the generic ack.
+  for "cycle armed for X seconds" beyond the generic ack. The handler
+  refuses cycles ≤ 5 seconds silently — there is no ack telling the
+  operator a too-short cycle was dropped (the absence of a `stat/ack`
+  is the only signal).
+- **Cycle minimum is a magic number.** The `atoi(payload) <= 5` floor in
+  `cmnd.cpp` is not surfaced as a `#define` or NVS-tunable constant.
 - **Payload parsing is `atoi`-based.** Only literal `"1"` turns a relay
   on; everything else turns it off, including `"on"`, `"true"`, and
-  human-friendly variants. IMPROVEMENTS #21.
+  human-friendly variants.
 - **No telemetry loop yet.** `tele/` exists as a placeholder header only;
-  the only periodic outbound traffic is `stat/<dev>/health` from the 60 s
-  heartbeat.
+  the only periodic outbound traffic is `stat/<dev>/health` and
+  `stat/<dev>/state` from the 60 s heartbeat.
 - **CA + broker URI baked into firmware.** Rotating either requires a
-  reflash of every device. IMPROVEMENTS #28.
+  reflash of every device.
 - **No OTA.** All firmware updates are physical-access only.
-  IMPROVEMENTS #14.
 - **NVS partition is not encrypted.** Anyone with physical access can dump
-  WiFi + MQTT credentials with `esptool.py`. IMPROVEMENTS #15.
+  WiFi + MQTT credentials with `esptool.py`.
 - **`STATE_ERROR` is reached on transient MQTT errors.** Even a single
   transport hiccup paints the LED `STATE_ERROR` colour; it does not return
   to `STATE_ALL_IS_WELL` until the next successful `MQTT_EVENT_CONNECTED`.
-
-For the full ranked review (with fix sketches, severity, and resolution
-notes for items already addressed) see [`IMPROVEMENTS.md`](IMPROVEMENTS.md).
+- **MQTT payload reassembly.** Fragmented `MQTT_EVENT_DATA` events are
+  now **dropped** rather than mis-treated as complete, but the router
+  still does not reassemble multi-part publishes. The 256-byte oversize
+  drop on `topic_len` / `data_len` is a hard ceiling on routable
+  topics and payloads — well above anything currently in use, but
+  worth knowing before designing a new high-throughput topic family.
+- **`FW_VERSION` is a float.** It rides the health payload as `%f`
+  (`1.000000`), which is fine for numeric comparison but does not
+  generalise to semver-style strings.
+- **Last Will topic lifetime.** `lastWillTopic` is a function-static
+  `String` inside `initMqtt()`. That keeps the pointer stable for the
+  lifetime of the program (the only thing the IDF needs), but it also
+  means the topic can never change without a reflash — there is no
+  path to rotate the device id and have the LWT follow.
