@@ -8,6 +8,7 @@
 #define STATE_MQTT_CONNECTING 2
 #define STATE_MQTT_DISCONNECTED 3
 #define STATE_ALL_IS_WELL 4
+#define STATE_PROVISION 5
 #define STATE_ERROR 255
 
 #include <Arduino.h>

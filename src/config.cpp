@@ -2,6 +2,7 @@
 #include <Preferences.h>
 
 #include "statusManager/statusManager.h"
+#include "provision.h"
 
 const char* ca_cert = "-----BEGIN CERTIFICATE-----\n"
 "MIIDVTCCAj2gAwIBAgIUPvVD1r0tzEn/Ha5rRQ3uNTuDAlwwDQYJKoZIhvcNAQEL\n"
@@ -43,78 +44,65 @@ int *relayState;
 
 void getDeviceSpecificConfig() {
     Preferences prefs;
+    
     prefs.begin("creds", true);
-
-    ssid = prefs.getString("wifi_ssid", "readError");
-    wifiPassword = prefs.getString("wifi_pass", "readError");
-    username = prefs.getString("dev_id", "readError");
-    password = prefs.getString("mqtt_pass", "readError");
-
+    String _ssid    = prefs.getString("wifi_ssid", "readError");
+    String _wifiPwd = prefs.getString("wifi_pass", "readError");
+    String _devId   = prefs.getString("dev_id",    "readError");
+    String _mqttPwd = prefs.getString("mqtt_pass", "readError");
     prefs.end();
 
-    // due to  the  required needs the offset will be from 0 to 15 only
-    // note to readers, i did this cause, if pin offset is 4, that means first  4 gpio will be used for charger, and rest 12 will be used for light, if it is 10, then 10 pins charger, last 6 lights, and so on.
     prefs.begin("pinDistribution", true);
-    pinOffset = prefs.getUChar("offset", 255);
-    totalPins = prefs.getUChar("totalPin", 255);
+    uint8_t _offset = prefs.getUChar("offset",   255);
+    uint8_t _total  = prefs.getUChar("totalPin", 255);
     prefs.end();
 
-    if(ssid.compareTo("readError") == 0 || wifiPassword.compareTo("readError") == 0 || username.compareTo("readError") == 0 || password.compareTo("readError") == 0 || totalPins > 16 || pinOffset > totalPins) {
-        statusHandler(STATE_ERROR);
-        Serial.println("Could not, get the appropriate read value from NVS\nRecheck provisioned device specific config\nRebooting...");
-        delay(5000);
-        ESP.restart();
+    uint8_t _pinMap[16];
+    prefs.begin("pinMapping", true);
+    char k[2] = {0};
+    for (int i = 0; i < 16; i++) {
+        k[0] = 'A' + i;
+        _pinMap[i] = prefs.getUChar(k, 255);
+    }
+    prefs.end();
 
+    bool pinMapOk = (_total >= 1 && _total <= 16);
+    for (int i = 0; pinMapOk && i < _total; i++) {
+        if (_pinMap[i] == 255) pinMapOk = false;
+    }
+    const bool nvsOk =
+        _ssid    != "readError" &&
+        _wifiPwd != "readError" &&
+        _devId   != "readError" &&
+        _mqttPwd != "readError" &&
+        _offset <= _total &&
+        pinMapOk;
+
+    if (!nvsOk) {
+        provision();
     }
 
+    ssid         = _ssid;
+    wifiPassword = _wifiPwd;
+    username     = _devId;
+    password     = _mqttPwd;
+    pinOffset    = _offset;
+    totalPins    = _total;
+
     chargerPin = new int[pinOffset];
-    lightPin = new int[totalPins - pinOffset];
+    lightPin   = new int[totalPins - pinOffset];
     relayState = new int[totalPins]();   // value-initialised → all zero at boot
 
-    int counter;
-    int i = 0;
-
-    prefs.begin("pinMapping", true);
-
-    char tmp[2] = {0};
-    for(counter = 65; counter < (65+pinOffset); counter++) {
-        tmp[0] = (char)counter;
-        tmp[1] = '\0';
-        chargerPin[i] = prefs.getUChar(tmp, 255);
-
-        if(chargerPin[i] == 255) {
-            statusHandler(STATE_ERROR);
-            Serial.println("Could not, get the appropriate read value from NVS\nRecheck provisioned device specific config\nRebooting...");
-            delay(5000);
-            ESP.restart();
-        }
-
+    for (int i = 0; i < pinOffset; i++) {
+        chargerPin[i] = _pinMap[i];
         pinMode(chargerPin[i], OUTPUT);
         digitalWrite(chargerPin[i], HIGH);
         relayState[i] = 1;
-
-        i++;
-    }
-    i=0;
-
-    for(counter; counter < (65 + totalPins); counter++) {
-        tmp[0] = char(counter);
-        tmp[1] = '\0';
-        lightPin[i] = prefs.getUChar(tmp, 255);
-
-        if(lightPin[i] == 255) {
-            statusHandler(STATE_ERROR);
-            Serial.println("Could not, get the appropriate read value from NVS\nRecheck provisioned device specific config\nRebooting...");
-            delay(5000);
-            ESP.restart();
-        }
-
-        pinMode(lightPin[i], OUTPUT);
-        digitalWrite(lightPin[i], LOW);
-
-
-        i++;
     }
 
-    prefs.end();
+    for (int i = pinOffset, j = 0; i < totalPins; i++, j++) {
+        lightPin[j] = _pinMap[i];
+        pinMode(lightPin[j], OUTPUT);
+        digitalWrite(lightPin[j], LOW);
+    }
 }

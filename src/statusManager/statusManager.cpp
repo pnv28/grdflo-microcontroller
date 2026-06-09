@@ -22,6 +22,9 @@ void statusHandler(const u8_t statusCode) {
     case 4:
         rgbLedWrite(LED_PIN, 30, 0, 0);
         break;
+    case 5:
+        rgbLedWrite(LED_PIN, 189, 245, 255);
+        break;
     case 255:
         rgbLedWrite(LED_PIN, 0, 255, 0);
         break;
