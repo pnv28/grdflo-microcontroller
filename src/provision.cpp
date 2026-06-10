@@ -5,23 +5,15 @@
 
 #include "provision.h"
 #include "statusManager/statusManager.h"
+#include "config.h"
 
-// ── Protocol constants ──────────────────────────────────────────────────────
-// Banner cadence: emit the READY string roughly every second so the browser
-// catches it within a poll of opening the serial port.
 static constexpr uint32_t BANNER_INTERVAL_MS = 1000;
 
-// Hard cap on a single line of input. The legitimate payload is ~300 bytes;
-// 1 KB gives huge headroom while bounding the buffer.
 static constexpr size_t   MAX_LINE_LEN       = 1024;
 
-// ESP32-C3 has GPIO 0-21. We don't enforce strapping/USB-pin exclusions here;
-// the firmware author controls the PCB and the dashboard's default map.
 static constexpr int      GPIO_MAX           = 21;
 
 
-// Emit a one-line error message in the protocol's framing. Browser handlers
-// scan for the `<<ERR ` prefix and surface the reason verbatim to the user.
 static void sendErr(const char* reason) {
     Serial.print("<<ERR ");
     Serial.print(reason);
@@ -141,5 +133,21 @@ void provision() {
         esp_task_wdt_reset();
 
         delay(10); 
+    }
+}
+
+void handleSerialPort() {
+    static char buf[48];
+    static uint8_t len = 0;
+    while (Serial.available() > 0) {
+        char c = Serial.read();
+        if (c == '\r') continue;
+        if (c == '\n') {
+            buf[len] = '\0';
+            if (len && strstr(buf, "GRDFLO-WHOAMI"))
+                Serial.printf("<<GRDFLO-INITIALISED v1 dev=%s>>\n", username.c_str());
+            len = 0;
+        } else if (len < sizeof(buf) - 1) buf[len++] = c;
+        else len = 0;
     }
 }

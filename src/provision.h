@@ -2,5 +2,6 @@
 #define PROVISION_H
 
 void provision();
+void handleSerialPort();
 
 #endif

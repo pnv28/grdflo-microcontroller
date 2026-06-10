@@ -5,6 +5,7 @@ void initWiFiConnection(const char *ssid, const char *password) {
     WiFi.setAutoReconnect(true);
     WiFi.persistent(false);
     WiFi.setSleep(false);
+    WiFi.mode(WIFI_STA);
     WiFi.begin(ssid, password);
     Serial.println("Trying to connect to WiFi");
     int attempts = 0;
@@ -14,9 +15,11 @@ void initWiFiConnection(const char *ssid, const char *password) {
         attempts++;
     }
 
+    delay(1000);
+
     if (WiFi.status() != WL_CONNECTED) {
         statusHandler(STATE_ERROR);
-        Serial.println("WiFi failed, rebooting...");
+        Serial.printf("\nWiFi failed, WiFi.status() = %d, rebooting...\n", WiFi.status());
         delay(5000);
         ESP.restart();
     }

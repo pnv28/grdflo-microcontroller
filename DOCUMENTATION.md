@@ -28,10 +28,12 @@ boot, then connects to an EMQX broker and listens for routed commands.
 13. [WiFi management](#wifi-management)
 14. [Watchdog & self-healing](#watchdog--self-healing)
 15. [Cycle (timed re-enable)](#cycle-timed-re-enable)
-16. [`nvs_partition_gen.py` — provisioning utility](#nvs_partition_genpy--provisioning-utility)
-17. [Build, provision, and flash](#build-provision-and-flash)
-18. [Extending the firmware](#extending-the-firmware)
-19. [Known limitations / TODOs](#known-limitations--todos)
+16. [Provisioning mode](#provisioning-mode)
+    - [Runtime serial handshake](#runtime-serial-handshake)
+17. [`nvs_partition_gen.py` — provisioning utility](#nvs_partition_genpy--provisioning-utility)
+18. [Build, provision, and flash](#build-provision-and-flash)
+19. [Extending the firmware](#extending-the-firmware)
+20. [Known limitations / TODOs](#known-limitations--todos)
 
 ---
 
@@ -61,8 +63,17 @@ Each device is a single ESP32-C3 module that:
   panics a wedged `loop()`.
 
 There is no `setup`-time AP, no captive portal, and no OTA. Devices are
-**factory-provisioned** by flashing a pre-built NVS partition image generated
-from `nvs.csv` via `nvs_partition_gen.py`.
+normally **factory-provisioned** by flashing a pre-built NVS partition
+image generated from `nvs.csv` via `nvs_partition_gen.py`. As a
+fallback, an on-device **serial provisioning mode** also exists:
+whenever `getDeviceSpecificConfig()` finds NVS missing, sentinel, or
+malformed (any of: `creds` strings unset, `pinDistribution.offset >
+totalPin`, `totalPin` not in `1..16`, or any required `pinMapping` slot
+returning `255`), the firmware drops into `provision()` instead of
+rebooting. The **GridFlow web-based provisioning + flash utility at
+[`slms.grdflo.com`](https://slms.grdflo.com)** drives this mode from a
+browser over USB-CDC serial (via the Web Serial API) — see
+[Provisioning mode](#provisioning-mode).
 
 ---
 
@@ -87,12 +98,26 @@ hardware UART, so those flags are absent from the wrover env;
 `-DBOARD_HAS_PSRAM` is its only differential build flag.
 
 The pioarduino fork is used (rather than the official Espressif PlatformIO
-platform) because it tracks newer ESP-IDF releases. No third-party
-`lib_deps` are pulled in — the firmware uses only Arduino + ESP-IDF
-(`esp_mqtt_client_*`, `esp_task_wdt_*`) APIs. An earlier
-`bblanchon/ArduinoJson` pin was removed once it became clear that all
-`stat/` payloads are small, fixed-shape strings built directly via
-`snprintf` (see [`stat/` outgoing status messages](#stat--outgoing-status-messages)).
+platform) because it tracks newer ESP-IDF releases.
+
+One third-party library is now pulled in via `lib_deps`:
+
+```ini
+lib_deps = bblanchon/ArduinoJson@7.4.2
+```
+
+ArduinoJson is used **only** by `src/provision.cpp` — the serial-port
+provisioning protocol parses an inbound JSON line per
+`handleLine()`. It is **not** used by any `stat/` publisher: all
+outbound `stat/` payloads are still small, fixed-shape strings built
+directly with `snprintf` (see
+[`stat/` outgoing status messages](#stat--outgoing-status-messages)).
+The dependency was reintroduced specifically to avoid hand-rolling a
+JSON parser tolerant of the payload shape emitted by the web
+provisioner at [`slms.grdflo.com`](https://slms.grdflo.com).
+
+The rest of the firmware uses only Arduino + ESP-IDF
+(`esp_mqtt_client_*`, `esp_task_wdt_*`) APIs.
 
 ### Firmware version
 
@@ -125,6 +150,7 @@ flowchart TB
     subgraph ESP32C3["ESP32-C3 device"]
         Main["main.cpp<br/>(setup + loop)"]
         Config["config.cpp<br/>NVS reader"]
+        Provision["provision.cpp<br/>Serial JSON fallback"]
         Status["statusManager<br/>RGB LED"]
         Wifi["wifiUtils<br/>connect / watch"]
         Mqtt["mqttManager<br/>event loop"]
@@ -136,9 +162,14 @@ flowchart TB
 
     NVS[("NVS partition<br/>creds + pinDistribution<br/>+ pinMapping")]
     Broker[("EMQX broker<br/>mqtts://...:8883")]
+    SerialHost[("USB-CDC host<br/>slms.grdflo.com<br/>(browser via Web Serial)")]
 
     NVS --> Config
-    Config --> Relays
+    Config -->|"NVS valid"| Relays
+    Config -->|"NVS invalid / missing"| Provision
+    Provision <-->|"provisioning: &lt;&lt;READY v1&gt;&gt; / JSON line / &lt;&lt;OK v1&gt;&gt; over Serial"| SerialHost
+    Provision -->|"write + ESP.restart()"| NVS
+    Main <-->|"runtime: handleSerialPort() &lt;&lt;GRDFLO-WHOAMI&gt;&gt; / &lt;&lt;GRDFLO-INITIALISED&gt;&gt;"| SerialHost
     Main --> Wifi
     Main --> Mqtt
     Mqtt <-->|"TLS + MQTT"| Broker
@@ -148,11 +179,12 @@ flowchart TB
     Cmnd --> Stat
     Conf --> Stat
     Conf --> NVS
-    Stat -->|"stat/&lt;dev&gt;/{ack,health,state}"| Mqtt
+    Stat -->|"stat/&lt;dev&gt;/{ack,health,state,onoff}"| Mqtt
     Status -.->|"every transition"| Main
     Status -.-> Wifi
     Status -.-> Mqtt
     Status -.-> Config
+    Status -.-> Provision
 ```
 
 The device is single-threaded from a user-code perspective — `loop()` runs on
@@ -176,7 +208,8 @@ grdflo-microcontroller/
 ├── test/                      # (empty / PIO scaffolding only)
 └── src/
     ├── main.cpp               # setup() + loop()
-    ├── config.h / config.cpp  # globals + NVS bootstrap
+    ├── config.h / config.cpp  # globals + NVS bootstrap (calls provision() on bad NVS)
+    ├── provision.h / provision.cpp  # serial-port JSON provisioning fallback (provision()) + runtime WHOAMI handshake (handleSerialPort())
     ├── cmd.h / cmd.cpp        # DEPRECATED — entire file is commented out
     ├── mqttManager/
     │   ├── mqttManager.h
@@ -204,8 +237,14 @@ grdflo-microcontroller/
 
 Note: `src/cmd.h` and `src/cmd.cpp` are deprecated. Both files are entirely
 commented out and exist only because `mqttManager.cpp` still carries a
+`// #include "cmd.h" DEPRECIATED` line and a
 `/* DEPRECIATED ... cmd(payload); */` comment block referring to the old
-flat dispatcher. The MQTT manager no longer includes `cmd.h`.
+flat dispatcher. The MQTT manager no longer actively includes `cmd.h`.
+`main.cpp` does still carry a live `#include "cmd.h"` (line 6) but
+nothing in `main.cpp` references any symbol from it — and `cmd.h`
+itself is entirely commented out (no preprocessor directives, no
+declarations), so the include is a true no-op. It can be removed
+without behavioural change.
 
 ---
 
@@ -225,49 +264,59 @@ sequenceDiagram
     Boot->>Setup: start
     Setup->>LED: STATE_BOOT (white-ish)
     Setup->>Setup: Serial.begin(115200)
-    Setup->>Setup: pinMode(RED_PIN), pinMode(BLUE_PIN)
-    Setup->>Setup: esp_task_wdt_reconfigure (30 s)
+    Setup->>Setup: Serial.setTxTimeoutMs(0)
+    Setup->>Setup: print "BOOT TIME FREE HEAP: ..."
+    Setup->>Setup: esp_task_wdt_reconfigure (30 s, panic)
     Setup->>Setup: esp_task_wdt_add(NULL)
-    Setup->>Cfg: read NVS
+    Setup->>Cfg: getDeviceSpecificConfig()
     Cfg->>NVS: creds: wifi_ssid, wifi_pass, dev_id, mqtt_pass
     Cfg->>NVS: pinDistribution: offset, totalPin
-    Cfg->>NVS: pinMapping: A..(A+totalPin-1) -> GPIO numbers
-    alt any read failed or values out of range
-        Cfg->>LED: STATE_ERROR
-        Cfg->>Boot: ESP.restart() after 5 s
+    Cfg->>NVS: pinMapping: read all 16 slots A..P into local _pinMap[]
+    Cfg->>Cfg: validate (creds set, 1<=totalPin<=16, offset<=totalPin, _pinMap[0..totalPin-1] != 255)
+    alt nvsOk == false
+        Cfg->>LED: STATE_PROVISION
+        Cfg->>Boot: provision() — busy-loop until valid JSON line, then ESP.restart()
     end
-    Cfg->>Cfg: pinMode(chargerPin[i], OUTPUT) + digitalWrite(HIGH)
-    Cfg->>Cfg: pinMode(lightPin[i], OUTPUT) + digitalWrite(LOW)
+    Cfg->>Cfg: commit locals to globals (ssid, wifiPassword, username, password, pinOffset, totalPins)
+    Cfg->>Cfg: pinMode(chargerPin[i], OUTPUT) + digitalWrite(HIGH) + relayState[i]=1
+    Cfg->>Cfg: pinMode(lightPin[j], OUTPUT) + digitalWrite(LOW)
     Setup->>Setup: delay(3000)
     Setup->>Wifi: initWiFiConnection(ssid, pass)
     Wifi->>LED: STATE_WIFI_CONNECTING
-    Wifi-->>Setup: connected (or reboot after 20 attempts)
+    Wifi-->>Setup: connected (or reboot after 20 attempts + 1 s grace)
     Setup->>Mqtt: initMqtt() (LWT armed: stat/<dev>/onoff offline)
     Mqtt->>LED: STATE_MQTT_CONNECTING
     Mqtt->>Broker: TLS handshake + CONNECT
     Broker-->>Mqtt: CONNACK
     Mqtt->>LED: STATE_ALL_IS_WELL
-    Mqtt->>Broker: publish stat/<dev>/onoff "online" / SUBSCRIBE cmnd|conf|cmnd/all (QoS 1)
+    Mqtt->>Broker: publish stat/<dev>/onoff "online" (QoS 2, retained) / SUBSCRIBE cmnd|conf|cmnd/all (QoS 1)
 ```
 
-Concrete order in `setup()` ([`src/main.cpp`](src/main.cpp:24)):
+Concrete order in `setup()` ([`src/main.cpp:24`](src/main.cpp:24)):
 
 1. `statusHandler(STATE_BOOT)`.
 2. `Serial.begin(115200)`.
-3. `Serial.printf("BOOT TIME FREE HEAP: %d\n", ESP.getFreeHeap());` —
+3. `Serial.setTxTimeoutMs(0)` — disable the USB-CDC transmit blocking
+   timeout. With CDC-on-boot the default is to block in `Serial.write()`
+   waiting for a host to drain the TX buffer; setting the timeout to `0`
+   makes every TX path non-blocking so an absent or slow USB host can
+   never stall `loop()` (and therefore can never trip the task watchdog).
+   This matters: a device without a USB host attached is the common case.
+4. `Serial.printf("BOOT TIME FREE HEAP: %d\n", ESP.getFreeHeap());` —
    first thing on the serial after the bootloader, makes it easy to spot
    memory regressions across firmware revisions.
-4. Watchdog: `esp_task_wdt_reconfigure(&wdt_cfg)` (30 s, panic on
+5. Watchdog: `esp_task_wdt_reconfigure(&wdt_cfg)` (30 s, panic on
    timeout) then `esp_task_wdt_add(NULL)` to subscribe the current task.
-5. `getDeviceSpecificConfig()` — reads NVS, allocates `chargerPin[]`,
+6. `getDeviceSpecificConfig()` — reads NVS, allocates `chargerPin[]`,
    `lightPin[]`, `relayState[]`, drives boot-time charger HIGH and light
-   LOW.
-6. `delay(3000)` — wait for "all components to initialise, mainly WiFi
+   LOW. **Or** drops into `provision()` and never returns if NVS is
+   invalid.
+7. `delay(3000)` — wait for "all components to initialise, mainly WiFi
    related hardware, such that when we try to connect everything is on
    and running" (per the in-source comment, updated from the older
    "earlier testing" wording).
-7. `initWiFiConnection(ssid.c_str(), wifiPassword.c_str())`.
-8. `initMqtt()`.
+8. `initWiFiConnection(ssid.c_str(), wifiPassword.c_str())`.
+9. `initMqtt()`.
 
 Note: there are **no** `pinMode(RED_PIN, OUTPUT)` /
 `pinMode(BLUE_PIN, OUTPUT)` calls in current `setup()` — the RED / BLUE
@@ -276,8 +325,8 @@ runtime code path, consistent with the in-source `// i know it is
 bricked` comment on `BLUE_PIN`.
 
 Boot-time chargers are forced HIGH (`digitalWrite(chargerPin[i], HIGH)` in
-`config.cpp:93`); lights are forced LOW
-(`digitalWrite(lightPin[i], LOW)` in `config.cpp:113`). Both are
+[`config.cpp:99`](src/config.cpp:99)); lights are forced LOW
+(`digitalWrite(lightPin[j], LOW)` in [`config.cpp:106`](src/config.cpp:106)). Both are
 explicit — no relay channel is left at the GPIO's reset-time default.
 Combined with the active-low wiring polarity:
 
@@ -291,8 +340,47 @@ Combined with the active-low wiring polarity:
 then the charger-init loop sets `relayState[i] = 1` for each charger
 immediately after `digitalWrite(chargerPin[i], HIGH)`. Light entries
 stay at the value-initialised `0`, which already matches the
-`digitalWrite(lightPin[i], LOW)` electrical state, so the in-memory
+`digitalWrite(lightPin[j], LOW)` electrical state, so the in-memory
 mirror is consistent across both groups from boot.
+
+### `loop()` body ([`src/main.cpp:42`](src/main.cpp:42))
+
+The main loop is short and runs every Arduino tick. In order:
+
+1. **`esp_task_wdt_reset()`** — feed the 30 s task watchdog. Every
+   subsequent step must complete in well under that budget.
+2. **`handleSerialPort()`** — drain any pending USB-CDC input. This is
+   the runtime `<<GRDFLO-WHOAMI>>` handshake — see
+   [Runtime serial handshake](#runtime-serial-handshake). Implemented
+   in [`src/provision.cpp:139`](src/provision.cpp:139), it is **not**
+   the same code path as `provision()`.
+3. **`millis()` snapshot into `currMillis`.**
+4. **Cycle timer check.** If `cycleFlag` is set and
+   `currMillis - cycleStart >= cycleInterval`, print
+   `Cycle fired: charger N re-enabling after <ms> ms`, call
+   `charger(cycleID, true)`, and clear `cycleFlag`. See
+   [Cycle (timed re-enable)](#cycle-timed-re-enable).
+5. **WiFi-loss watchdog.** If `WiFiDisconnectSince != 0` and the radio
+   has been continuously down for ≥ 180 000 ms,
+   `statusHandler(STATE_ERROR)` + `ESP.restart()`. Checked **every
+   iteration**, not just the heartbeat tick — see
+   [WiFi-loss watchdog](#wifi-loss-watchdog).
+6. **60 s heartbeat tick.** Once `currMillis - prevMillis >= 60000`:
+   - Update `prevMillis = currMillis`.
+   - Print `[<currMillis>] Free heap: <bytes> bytes` to serial.
+   - If `globalErrorCounter >= 5`,
+     `statusHandler(STATE_ERROR)` + `ESP.restart()` (see
+     [Error-counter reboot](#error-counter-reboot)).
+   - Call `statHealth()` — publish `stat/<dev>/health`.
+   - Call `statState()` — publish `stat/<dev>/state`.
+   - Call `checkWiFiStatus(ssid, wifiPassword)` — see
+     [WiFi management](#wifi-management).
+
+There is no inbound MQTT dispatch in `loop()` itself; MQTT events fire
+asynchronously into `mqtt_event_handler()` (on the IDF MQTT task) and
+synchronously dispatch into the `cmnd()` / `conf()` handlers from
+there. `loop()` only owns the periodic publishers, the cycle timer,
+the WiFi watchdog, and the serial handshake.
 
 ---
 
@@ -300,7 +388,35 @@ mirror is consistent across both groups from boot.
 
 All per-device configuration lives in NVS, split into three namespaces.
 `getDeviceSpecificConfig()` ([`src/config.cpp:45`](src/config.cpp:45)) reads
-them in order. The reference provisioning CSV is [`nvs.csv`](nvs.csv).
+each namespace into **local** scratch variables, validates the full
+set, and only then commits to the externally-visible globals. The
+reference provisioning CSV is [`nvs.csv`](nvs.csv).
+
+### Read → validate → commit flow
+
+The function does three things in strict order — no global state
+mutates until validation passes:
+
+1. **Read everything into locals.** `_ssid`, `_wifiPwd`, `_devId`,
+   `_mqttPwd`, `_offset`, `_total`, plus a `uint8_t _pinMap[16]` that
+   is populated by walking keys `'A'` through `'P'`. All 16 slots are
+   read unconditionally (the unused tail just holds the `255` sentinel)
+   so the read pass does not depend on the value of `_total` it is also
+   reading.
+2. **Validate as a whole.** A single boolean `nvsOk` AND-folds: each
+   `creds` string must not equal `"readError"`, `_offset <= _total`,
+   `_total` ∈ `[1, 16]`, and `_pinMap[0..(_total-1)]` must all be
+   non-`255`.
+3. **If invalid, drop into `provision()` and never return.** The
+   serial-port provisioning loop owns the device until it accepts a
+   well-formed JSON line and reboots. If valid, copy locals → globals
+   (`ssid`, `wifiPassword`, `username`, `password`, `pinOffset`,
+   `totalPins`) and proceed to relay-pin setup.
+
+This shape replaces the older "fail-fast → STATE_ERROR + reboot every
+5 s" loop, which would simply spin a misconfigured device forever; a
+device with bad NVS is now interactively recoverable from a USB-CDC
+host.
 
 ### Namespace `creds`
 
@@ -311,8 +427,10 @@ them in order. The reference provisioning CSV is [`nvs.csv`](nvs.csv).
 | `dev_id`    | string | `username` global → MQTT `client_id`/`username` and every topic | Per-device identity |
 | `mqtt_pass` | string | `password` global → MQTT password | Broker auth |
 
-If any of the four returns the sentinel `"readError"`, the device flashes
-`STATE_ERROR`, prints a diagnostic, waits 5 s, and reboots.
+If any of the four returns the sentinel `"readError"`, the
+read-validate-commit flow treats the NVS state as invalid and enters
+`provision()` instead of committing the globals (see
+[Provisioning mode](#provisioning-mode)).
 
 ### Namespace `pinDistribution`
 
@@ -324,12 +442,14 @@ If any of the four returns the sentinel `"readError"`, the device flashes
 So a device with `totalPin=4, offset=2` has 2 chargers (channels 0–1) and 2
 lights (channels 0–1 within the lights array, i.e. global table indices 2–3).
 
-Sanity check (`config.cpp:63`): if `totalPins > 16` or `pinOffset > totalPins`,
-the device flashes `STATE_ERROR` and reboots. Note that `getUChar` (not
-`getChar`) is used so the sentinel `255` round-trips correctly — `getChar`
-returns `int8_t` and would silently overflow `255` to `-1`. Since
-`255 > 16`, a missing `totalPin` key is automatically caught by the same
-upper-bound check; no separate sentinel test is needed.
+Sanity check (`config.cpp:69`–`79`): `_total` must be in `[1, 16]`
+and `_offset <= _total`. Note that `getUChar` (not `getChar`) is used
+so the sentinel `255` round-trips correctly — `getChar` returns
+`int8_t` and would silently overflow `255` to `-1`. Since `255 > 16`,
+a missing `totalPin` key is automatically caught by the same
+upper-bound check; no separate sentinel test is needed. A failed
+check sends the device into [provisioning mode](#provisioning-mode)
+rather than rebooting.
 
 ### Namespace `pinMapping`
 
@@ -343,21 +463,28 @@ C,data,u8,6     ← channel 2 (light index 0)
 D,data,u8,7     ← channel 3 (light index 1)
 ```
 
-The boot code iterates `counter = 65 .. 65 + totalPins - 1`, building the
-single-character key from `counter` and reading the GPIO number for each
-channel. Channels `[0 .. pinOffset)` go into `chargerPin[]`; the rest go
-into `lightPin[]`. Any key that returns the sentinel `255` triggers
-`STATE_ERROR` + reboot. Single-character keys are used because NVS keys
-are capped at 15 characters and single ASCII characters are the most
-compact option that still covers the 16-channel ceiling (`'A'` through
-`'P'`).
+The boot code reads **all 16 possible slots** unconditionally — keys
+`'A'` through `'P'` — into the local `uint8_t _pinMap[16]` in a single
+pass. Unused tail slots simply hold the sentinel `255`. Only the
+**first `_total` slots** are then required to be non-`255`; the
+validation loop short-circuits on the first failure. Single-character
+keys are used because NVS keys are capped at 15 characters and single
+ASCII characters are the most compact option that still covers the
+16-channel ceiling.
 
-The two loops stay in algebraic sync: the charger loop ends with
-`counter = 65 + pinOffset`; the light loop starts from that value and
-ends at `65 + totalPins`, so the second loop runs exactly
-`totalPins - pinOffset` iterations — the size of `lightPin[]`. The split
-point cancels out, so regardless of `pinOffset`, the two loops together
-always cover exactly `totalPins` keys.
+After validation, the commit-and-wire pass splits `_pinMap` cleanly:
+
+- `for (i = 0; i < pinOffset; i++)` → `chargerPin[i] = _pinMap[i]`,
+  `pinMode(... OUTPUT)`, `digitalWrite(... HIGH)`, `relayState[i] = 1`.
+- `for (i = pinOffset, j = 0; i < totalPins; i++, j++)` →
+  `lightPin[j] = _pinMap[i]`, `pinMode(... OUTPUT)`,
+  `digitalWrite(... LOW)`.
+
+So `chargerPin[]` exactly matches `_pinMap[0..pinOffset-1]` and
+`lightPin[]` exactly matches `_pinMap[pinOffset..totalPins-1]`. The
+two-pointer dual-counter form (`i` walks the source, `j` walks the
+destination) avoids the older approach's reliance on `counter` arithmetic
+shared across two separate NVS-read loops.
 
 The three arrays (`chargerPin`, `lightPin`, `relayState`) are
 **heap-allocated** rather than fixed-size for one reason: their size is
@@ -376,7 +503,7 @@ levels — `statState()` then reads the mirror without having to
 
 | Symbol | Source | Used by |
 | ------ | ------ | ------- |
-| `RED_PIN`, `BLUE_PIN` | `#define` (both `21`) | `main.cpp` (`pinMode` only) |
+| `RED_PIN`, `BLUE_PIN` | `#define` (both `21`) | Declared in `config.h` but **not used by any active runtime code path** — no `pinMode` and no `digitalWrite` in `main.cpp`, `provision.cpp`, or any other current source file. The only references are inside the commented-out `cmd.cpp`. The `// i know it is bricked` / `// note i might have fried gpio pin 21` comments in `config.h` are why. |
 | `FW_VERSION` | `#define 1.0` | `stat.cpp::statHealth()` — embedded in every health payload |
 | `MAX_SEGMENT` | `#define 6` | `mqttManager.cpp` topic tokeniser — upper bound on `/`-split tokens. The longest currently-routed form (`cmnd/<dev>/charger/<id>/cycle`) is 5 segments, so 6 leaves one slot of headroom |
 | `ca_cert` | static literal | `mqttManager.cpp` (TLS) |
@@ -384,9 +511,10 @@ levels — `statState()` then reads the mirror without having to
 | `ssid`, `wifiPassword`, `username`, `password` | NVS `creds` | WiFi + MQTT init |
 | `pinOffset`, `totalPins` | NVS `pinDistribution` | All channel math |
 | `chargerPin[]`, `lightPin[]`, `relayState[]` | Heap-allocated in `config.cpp` | `cmnd/`, `stat/` |
-| `cycleID`, `cycleInterval`, `cycleStart`, `cycleFlag` | Set by `cycle()` in `cmnd.cpp`; read in `loop()` | Timed charger re-enable |
+| `cycleInterval`, `cycleStart`, `cycleFlag` | Set by `cycle()` in `cmnd.cpp`; read in `loop()` | Timed charger re-enable |
+| `cycleID` | Set by `cycle()` in `cmnd.cpp`; read in `loop()`. **Note:** unlike the other cycle globals, `cycleID` is declared `extern int cycleID;` in [`src/functions/cmnd/cmnd.h`](src/functions/cmnd/cmnd.h:9), not in `config.h`. `main.cpp` reaches it transitively via `#include "functions/cmnd/cmnd.h"`. | Timed charger re-enable |
 | `globalErrorCounter` | `mqttManager.cpp` (incremented in `MQTT_EVENT_ERROR`; reset in `MQTT_EVENT_CONNECTED`) | Reboot trigger in `loop()` |
-| `WiFiDisconnectSince` | `checkWiFiStatus.cpp` (timestamp on first loss; cleared when reconnected) | 3-minute WiFi-loss reboot trigger in `loop()` |
+| `WiFiDisconnectSince` | `checkWiFiStatus.cpp` (timestamp on first loss; cleared when reconnected). Declared `extern` in `wifiUtils.h`, not `config.h`. | 3-minute WiFi-loss reboot trigger in `loop()` |
 
 ---
 
@@ -882,12 +1010,13 @@ defined in `statusManager.h`:
 
 | State | Code | RGB written (R,G,B as written) | Triggered by |
 | ----- | ---- | ------------------------------ | ------------ |
-| `STATE_BOOT`               | 0   | (50, 50, 50)   | `setup()` first line |
-| `STATE_WIFI_CONNECTING`    | 1   | (100, 100, 0)  | `initWiFiConnection`, `checkWiFiStatus` |
-| `STATE_MQTT_CONNECTING`    | 2   | (40, 150, 0)   | `initMqtt()` |
-| `STATE_MQTT_DISCONNECTED`  | 3   | (100, 0, 100)  | `MQTT_EVENT_DISCONNECTED` |
-| `STATE_ALL_IS_WELL`        | 4   | (30, 0, 0)     | `MQTT_EVENT_CONNECTED` |
-| `STATE_ERROR`              | 255 | (0, 255, 0)    | Any unrecoverable error path |
+| `STATE_BOOT`               | 0   | (50, 50, 50)     | `setup()` first line |
+| `STATE_WIFI_CONNECTING`    | 1   | (100, 100, 0)    | `initWiFiConnection`, `checkWiFiStatus` |
+| `STATE_MQTT_CONNECTING`    | 2   | (40, 150, 0)     | `initMqtt()` |
+| `STATE_MQTT_DISCONNECTED`  | 3   | (100, 0, 100)    | `MQTT_EVENT_DISCONNECTED` |
+| `STATE_ALL_IS_WELL`        | 4   | (30, 0, 0)       | `MQTT_EVENT_CONNECTED` |
+| `STATE_PROVISION`          | 5   | (0, 0, 255)      | `provision()` — set once on entry, held for the duration of the serial loop |
+| `STATE_ERROR`              | 255 | (0, 255, 0)      | Any unrecoverable error path |
 
 > The WS2812 LED on the C3-DevKitM-1 transmits its bytes in **GRB** order,
 > not RGB. The Arduino `rgbLedWrite(pin, a, b, c)` API forwards them
@@ -902,6 +1031,7 @@ defined in `statusManager.h`:
 > | orange          | `(40, 150, 0)`         | red-heavy with a touch of green |
 > | cyan            | `(100, 0, 100)`        | green + blue, no red |
 > | dim green       | `(30, 0, 0)`           | green only          |
+> | pure blue (provision) | `(0, 0, 255)`     | `G=0, R=0, B=255` — solid bright blue, the only state in the palette with blue isolated from red and green; reads instantly as "waiting for serial input" and cannot be confused with any other state on-site |
 > | solid red       | `(0, 255, 0)`          | red only            |
 >
 > On the (commented-out) wrover env, GPIO 10 has no LED wired — the
@@ -910,11 +1040,16 @@ defined in `statusManager.h`:
 
 There is no animation tick or background task — `statusHandler()` is
 one-shot. Each call writes the LED and returns; the LED keeps that
-colour until the next call. A single solid-red `STATE_ERROR` covers all
-unrecoverable failure paths (NVS, WiFi, MQTT) deliberately — on-site,
-the *timing* distinguishes them (reboot loop = NVS, fail immediately
-after yellow = WiFi, fail after green = MQTT) more clearly than colour
-ever would.
+colour until the next call. A single solid-red `STATE_ERROR` covers
+the *runtime* unrecoverable failure paths (WiFi, MQTT) deliberately
+— on-site, *timing* distinguishes them (fail immediately after yellow
+= WiFi, fail after green = MQTT) more clearly than colour ever would.
+
+NVS failure is the one case that gets its own colour: bad NVS now
+parks the device on `STATE_PROVISION` (solid bright blue, the only blue-only state in the palette)
+rather than reboot-looping on `STATE_ERROR`. The new colour is the
+visible signal that the device wants a USB-CDC host to talk to it,
+not that it has crashed.
 
 There is no explicit "WiFi-came-back" or "everything-is-fine-again" call
 site either: after a network blip you'll see yellow → cyan → red briefly
@@ -926,7 +1061,8 @@ network stack rather than just the radio.
 stateDiagram-v2
     [*] --> Boot
     Boot --> WifiConnecting: getDeviceSpecificConfig OK
-    Boot --> Error: NVS read failure
+    Boot --> Provision: NVS invalid / missing
+    Provision --> [*]: valid JSON line accepted (writes NVS, ESP.restart())
     WifiConnecting --> MqttConnecting: WiFi up
     WifiConnecting --> Error: 20 attempts fail
     MqttConnecting --> AllIsWell: CONNACK
@@ -958,11 +1094,27 @@ Runs once during `setup()` after NVS is read. Sequence:
    trade-off is the wrong way round — staying awake gives lower
    latency on inbound MQTT publishes and reduces tail-latency spikes
    on outbound publishes, at no meaningful current-draw cost.
-5. `WiFi.begin(ssid, password)`
-6. Up to 20 retries of 500 ms each (≈10 s total).
-7. If still not connected: `statusHandler(STATE_ERROR)` + 5 s delay +
-   `ESP.restart()`.
-8. Otherwise: print local IP.
+5. `WiFi.mode(WIFI_STA)` — explicit station-only mode. Defaults vary
+   across Arduino-ESP32 minor versions; pinning STA here makes the
+   intent visible and rules out the AP/STA-combined default ever
+   silently coming back.
+6. `WiFi.begin(ssid, password)`
+7. Up to 20 retries of 500 ms each (≈10 s total), each iteration
+   printing a `.` to serial as a progress tick.
+8. **Post-loop `delay(1000)`** — an extra 1 s grace window after the
+   20-attempt loop. The retry loop exits the instant `WL_CONNECTED`
+   is observed, but the underlying Arduino WiFi state machine can take
+   a beat to finish DHCP / link-up bookkeeping after the association
+   itself succeeded. The 1 s buffer lets a borderline-late
+   association stabilise so the subsequent `WiFi.localIP()` print and
+   `initMqtt()` call see a fully-up stack.
+9. If still not connected: `statusHandler(STATE_ERROR)`, print
+   `WiFi failed, WiFi.status() = <N>, rebooting...` (the
+   `WiFi.status()` numeric code is the diagnostic — `1 =
+   WL_NO_SSID_AVAIL`, `4 = WL_CONNECT_FAILED`, `6 =
+   WL_DISCONNECTED`, etc. — surfaced so a serial log makes the
+   failure mode unambiguous), 5 s delay, `ESP.restart()`.
+10. Otherwise: print `Connected to <ssid>` and the local IP.
 
 ### `checkWiFiStatus(ssid, password)` ([`src/wifiUtils/checkWiFiStatus.cpp`](src/wifiUtils/checkWiFiStatus.cpp))
 
@@ -1055,16 +1207,27 @@ it is updated.
 
 The device hard-reboots (`ESP.restart()`) in any of these conditions:
 
-- NVS `creds` read failure (`config.cpp:66`).
-- NVS `pinMapping` read returns `255` for any required channel
-  (`config.cpp:89`, `config.cpp:109`).
-- WiFi fails to associate within 20 attempts during boot
-  (`initWiFiConnection.cpp:21`).
+- WiFi fails to associate within 20 attempts (plus the 1 s post-loop
+  grace delay) during boot
+  ([`initWiFiConnection.cpp:24`](src/wifiUtils/initWiFiConnection.cpp:24)).
 - WiFi has been disconnected for ≥ 180 000 ms after boot
-  (`main.cpp:54`).
-- `esp_mqtt_client_init()` returns `NULL` (`mqttManager.cpp:132`).
-- `globalErrorCounter >= 5` at the next 60 s tick (`main.cpp:65`).
-- Operator publishes `conf/<dev>/reboot` (`conf.cpp:20`).
+  ([`main.cpp:58`](src/main.cpp:58)).
+- `esp_mqtt_client_init()` returns `NULL`
+  ([`mqttManager.cpp:132`](src/mqttManager/mqttManager.cpp:132)).
+- `globalErrorCounter >= 5` at the next 60 s tick
+  ([`main.cpp:67`](src/main.cpp:67)).
+- Operator publishes `conf/<dev>/reboot`
+  ([`conf.cpp:20`](src/functions/conf/conf.cpp:20)).
+- After `provision()` successfully writes a fresh NVS payload, it
+  prints `<<OK v1>>`, flushes serial, delays 5 s, and reboots
+  ([`provision.cpp:97`](src/provision.cpp:97)).
+
+Note: a corrupt or missing NVS partition no longer triggers a reboot
+loop. Instead, `getDeviceSpecificConfig()` enters
+[`provision()`](#provisioning-mode), which busy-loops on Serial
+indefinitely (resetting the task watchdog each pass) until a host
+delivers a valid JSON line — at which point the device reboots once
+into the now-valid configuration.
 
 ---
 
@@ -1110,6 +1273,238 @@ Storage:
 There is exactly one slot. Issuing a second `cycle` while one is pending
 **overwrites** the previous one (and a new "off → wait → on" cycle starts
 against the new channel). There is no per-channel queue.
+
+---
+
+## Provisioning mode
+
+Implementation: [`src/provision.cpp`](src/provision.cpp),
+[`src/provision.h`](src/provision.h). Triggered exclusively by
+`getDeviceSpecificConfig()` when NVS validation fails (see the
+[Configuration & NVS layout](#configuration--nvs-layout)
+read-validate-commit flow).
+
+This mode is the **device-side half** of the GridFlow web-based
+provisioning + flashing tool hosted at
+[`slms.grdflo.com`](https://slms.grdflo.com). The browser tool drives
+both halves of getting a fresh device online: it can flash the
+firmware over USB-CDC (using `esptool`-equivalent logic running in
+the browser via the Web Serial API) and it can push the
+device-specific NVS payload over the same serial link by talking the
+protocol described below. From the operator's point of view it is one
+flow — plug the device in, fill out a form, click "provision".
+
+`provision()` is a **terminal busy-loop**: once entered it never
+returns. The only exits are (a) accepting a valid JSON line and
+`ESP.restart()`-ing, or (b) external power cycle / reset. The task
+watchdog is reset every iteration so the WDT does not fire mid-wait.
+
+### Purpose
+
+Replace the older "bad NVS → STATE_ERROR → 5 s → reboot → bad NVS"
+infinite reboot loop with an interactive recovery path that the
+[`slms.grdflo.com`](https://slms.grdflo.com) browser tool can drive
+end-to-end. The tool (or any serial terminal, for manual debugging)
+detects that the device is in provisioning mode by reading the banner
+string and then pushes a single JSON line containing the full NVS
+payload.
+
+### Wire protocol (line-oriented over USB-CDC at 115200 baud)
+
+All framing is line-delimited (`\n`). `\r` is silently consumed.
+
+**Device → host messages:**
+
+| Frame                                | Meaning |
+| ------------------------------------ | ------- |
+| `<<GRDFLO-PROVISION-READY v1>>`      | Banner. Emitted once on entry, then repeated every `BANNER_INTERVAL_MS = 1000 ms`. The repeating cadence guarantees that a host which attaches to the serial port **after** the device entered provisioning still sees the banner within ~1 s. |
+| `<<ERR <reason>>>`                   | Per-line rejection. `<reason>` is a short ASCII string — see [Error reasons](#error-reasons) below. The host should surface this verbatim to the user. |
+| `<<OK v1>>`                          | Final success. Emitted exactly once, immediately followed by `Serial.flush()`, a 5 s delay, and `ESP.restart()`. After this the host should expect the USB-CDC link to drop and reappear as the device re-enumerates running normal firmware. |
+
+**Host → device messages:**
+
+A single JSON object per line, terminated with `\n`. Maximum line
+length is `MAX_LINE_LEN = 1024` bytes — any longer and the device
+emits `<<ERR line too long>>`, drops the partial buffer, and skips
+characters until the next `\n` to resynchronise.
+
+### JSON schema
+
+```json
+{
+  "wifi_ssid": "string, non-empty",
+  "wifi_pass": "string, non-empty",
+  "dev_id":    "string, non-empty",
+  "mqtt_pass": "string, non-empty",
+  "pin_offset": 0,
+  "pin_total":  4,
+  "pin_map": { "A": 2, "B": 3, "C": 6, "D": 7 }
+}
+```
+
+Field requirements:
+
+- **`wifi_ssid`, `wifi_pass`, `dev_id`, `mqtt_pass`** — all four must
+  be present and non-empty strings. They are written to the NVS
+  `creds` namespace exactly as supplied (no normalisation, no
+  trimming).
+- **`pin_offset`** — integer, `0 <= pin_offset <= pin_total`. The
+  number of channels at the head of the table that are chargers; the
+  remainder are lights.
+- **`pin_total`** — integer, `1 <= pin_total <= 16`. Total number of
+  relay channels physically wired to this device.
+- **`pin_map`** — object whose keys are single capital letters
+  starting at `"A"`. Slots `"A"` through `"A" + pin_total - 1` must
+  all be present, integer-typed, and inside `[0, 21]` (the ESP32-C3
+  GPIO range — `GPIO_MAX = 21`). Slots beyond `pin_total` are
+  ignored; the device does not require, accept, or reject them
+  beyond the per-slot type check.
+
+### Validation order
+
+`handleLine()` checks fields in this order, returning on the first
+failure (so the host learns about one problem per line, not a list):
+
+1. JSON parse — failure surfaces ArduinoJson's `err.c_str()`.
+2. Per-field presence (`nullptr` check via `const char*`).
+3. Per-field non-emptiness (`strlen() != 0`).
+4. `pin_offset` / `pin_total` typed as integers.
+5. `pin_total ∈ [1, 16]`.
+6. `pin_offset ∈ [0, pin_total]`.
+7. `pin_map` present (`JsonObject` non-null).
+8. For each `i ∈ [0, pin_total)`, slot `('A' + i)` present, integer,
+   and in `[0, GPIO_MAX]`.
+
+If every check passes, three NVS writes happen in sequence:
+
+```text
+creds            wifi_ssid, wifi_pass, dev_id, mqtt_pass   (putString)
+pinDistribution  offset, totalPin                          (putUChar)
+pinMapping       A..(A + pin_total - 1)                    (putUChar)
+```
+
+Each namespace is opened read-write, written, then closed. The
+write is **not** transactional across namespaces — a power cut after
+`creds.end()` but before `pinDistribution.end()` would leave NVS in a
+half-written state. In practice, the JSON line is delivered over
+USB-CDC at line-rate and the host should not detach power until
+`<<OK v1>>` is received.
+
+### Error reasons
+
+The reason strings emitted as `<<ERR <reason>>>` are deliberately
+short and stable so the [`slms.grdflo.com`](https://slms.grdflo.com)
+web tool can string-match them to render specific per-field error
+states in its UI:
+
+| Reason text                                   | Meaning |
+| --------------------------------------------- | ------- |
+| ArduinoJson `DeserializationError::c_str()`   | JSON parse failed (e.g. `"InvalidInput"`). |
+| `missing wifi_ssid` / `wifi_pass` / `dev_id` / `mqtt_pass` | Key absent. |
+| `empty wifi_ssid` / `wifi_pass` / `dev_id` / `mqtt_pass`   | Key present but empty string. |
+| `missing pin_offset`                          | `pin_offset` absent or not an integer. |
+| `missing pin_total`                           | `pin_total` absent or not an integer. |
+| `pin_total out of range (1..16)`              | Self-explanatory. |
+| `pin_offset out of range (0..pin_total)`      | Self-explanatory. |
+| `missing pin_map`                             | `pin_map` absent or not an object. |
+| `pin_map missing or non-integer slot`         | A required slot key is absent or holds a non-int. |
+| `pin_map GPIO out of range (0..21)`           | A slot value is outside `[0, GPIO_MAX]`. |
+| `line too long`                               | Line exceeded `MAX_LINE_LEN = 1024` bytes — buffer was dropped and the device is resynchronising. |
+
+### Operator playbook
+
+**Standard path — via the web tool:**
+
+1. Plug the device into a USB host (USB-CDC, 115 200 baud — the C3's
+   native USB peripheral).
+2. Open [`slms.grdflo.com`](https://slms.grdflo.com) in a
+   Web-Serial-capable browser (Chrome / Edge / Opera on desktop —
+   Web Serial is not exposed in Firefox or Safari).
+3. Use the tool's "Connect" / "Flash" / "Provision" flow. When the
+   device is in provisioning mode (LED solid blue,
+   `<<GRDFLO-PROVISION-READY v1>>` banner ticking at 1 Hz), the tool
+   surfaces a form for WiFi / MQTT / pin map. Filling it and
+   submitting pushes the JSON line described above; the tool
+   surfaces `<<ERR ...>>` messages per-field and proceeds on
+   `<<OK v1>>` automatically.
+
+**Manual / debugging path — via a serial terminal:**
+
+1. Plug the device into a USB host.
+2. Open the serial port at 115 200 baud (the C3's native USB-CDC).
+3. If the banner `<<GRDFLO-PROVISION-READY v1>>` appears (and keeps
+   repeating ~1 Hz), the device is in provisioning mode.
+4. Send a single JSON object on one line, terminated with `\n`.
+5. Expect either `<<ERR ...>>` (fix the field and resend) or
+   `<<OK v1>>`.
+6. After `<<OK v1>>`, the device flushes, waits 5 s, and reboots.
+   Wait for re-enumeration; the device will come up in normal
+   firmware mode with the new NVS values.
+
+### What `provision()` does **not** do
+
+- Does **not** time out. If no host attaches, the device waits forever
+  (LED stuck on `STATE_PROVISION`, watchdog continuously reset).
+- Does **not** verify GPIO strapping/USB-pin exclusions on the C3 —
+  the constant `GPIO_MAX = 21` is the only check, on the assumption
+  that the firmware author controls the PCB and the
+  [`slms.grdflo.com`](https://slms.grdflo.com) tool ships sane
+  default pin-map presets.
+- Does **not** accept partial updates — every field in the schema
+  must be present in every line. There is no "patch only the WiFi
+  password" path; that is `conf/<dev>/edit/...` over MQTT (see
+  [`conf/` handler](#conf--runtime-configuration)).
+- Does **not** validate the cert chain, MQTT broker reachability, or
+  any other downstream concern — those are evaluated normally after
+  the post-`<<OK v1>>` reboot.
+
+### Runtime serial handshake
+
+Once a device has booted past `getDeviceSpecificConfig()` and is
+running normal firmware (NOT in `provision()`), a separate, much
+smaller function handles serial input on every `loop()` iteration:
+
+`handleSerialPort()` ([`src/provision.cpp:139`](src/provision.cpp:139))
+is called from `loop()` ([`src/main.cpp:44`](src/main.cpp:44)). It
+maintains a `static char buf[48]` line buffer, accumulating bytes
+between `\n` delimiters (`\r` is silently consumed, identical to
+`provision()`). On each completed line it does **exactly one** thing:
+
+- If the line contains the substring `"GRDFLO-WHOAMI"` (matched by
+  `strstr`, so any framing the host wraps it in is tolerated), the
+  device replies on serial with:
+
+  ```
+  <<GRDFLO-INITIALISED v1 dev=<username>>>
+  ```
+
+  where `<username>` is the `dev_id` from NVS.
+
+Any other line is silently discarded. Lines longer than 47 characters
+are rejected by resetting the buffer (no error reply — the input is
+deliberately tolerant).
+
+The purpose is to give the [`slms.grdflo.com`](https://slms.grdflo.com)
+web tool (or any host reattaching to a known device's serial port) a
+zero-side-effect way to:
+
+1. **Confirm a USB-CDC connection is to a GridFlow device** (vs any
+   other serial-port device the user might have selected).
+2. **Identify which device it is** without having to listen for a
+   periodic announce or trigger an MQTT round-trip.
+
+The handshake is one-shot per probe (the host sends
+`GRDFLO-WHOAMI\n` once and reads back the `INITIALISED` line). It
+shares the `<<...>>` framing convention used by `provision()` so a
+single parser on the web tool side handles both modes.
+
+The two serial protocols (`provision()` and `handleSerialPort()`) are
+**mutually exclusive** at runtime: a device is either in
+`provision()`'s busy-loop (NVS invalid; LED solid blue; emitting
+`<<GRDFLO-PROVISION-READY v1>>` at 1 Hz) **or** running normal
+firmware with `handleSerialPort()` polled from `loop()` (NVS valid;
+LED reflects live network state). The web tool decides which protocol
+to speak based on which banner it observes after opening the port.
 
 ---
 
@@ -1179,6 +1574,21 @@ pio device monitor -b 115200
 ```
 
 ### Provision NVS (per-device)
+
+There are two routes:
+
+- **Factory route (CSV → binary → esptool flash).** The deterministic
+  one used at first manufacture; described below.
+- **Web route via [`slms.grdflo.com`](https://slms.grdflo.com)
+  ([Provisioning mode](#provisioning-mode)).** Plug the device into
+  a USB-CDC host, open the site in Chrome/Edge, and use the
+  browser-based flasher + provisioner. The page handles both firmware
+  flashing (via Web Serial / `esptool`-in-browser) and pushing the
+  NVS payload (via the JSON-line protocol). Used for field
+  re-provisioning and recovering devices with corrupted NVS. No
+  command-line `esptool.py` invocation needed.
+
+The factory route:
 
 1. Edit a fresh `nvs.csv` with this device's credentials and pin map. Keep
    the row layout shown in [Configuration & NVS layout](#configuration--nvs-layout).
@@ -1317,3 +1727,31 @@ These are limitations of **the current code**:
   lifetime of the program (the only thing the IDF needs), but it also
   means the topic can never change without a reflash — there is no
   path to rotate the device id and have the LWT follow.
+- **`provision()` has no timeout.** A device that drops into
+  provisioning mode waits forever for a host. There is no fallback
+  to retry the original NVS read after N minutes, no AP-mode
+  fallback, no "give up and reboot" path. Operationally this is
+  fine — a device in this state visibly broadcasts that fact via the
+  solid-blue LED and the 1 Hz `<<GRDFLO-PROVISION-READY v1>>`
+  banner — but it does mean an in-field device that lost its NVS will
+  not self-recover without a USB host visit.
+- **`provision()` writes are not transactional.** A power cut between
+  the `creds`, `pinDistribution`, and `pinMapping` namespace writes
+  would leave NVS half-populated. The next boot would re-enter
+  provisioning (the validation catches any missing piece), so the
+  failure mode is "another provisioning round" rather than data
+  corruption — but the host should keep the device powered until
+  `<<OK v1>>` lands.
+- **`provision()` accepts any GPIO in `[0, 21]`.** Strapping pins
+  (GPIO 2, 8, 9 on the C3) and USB-CDC pins (GPIO 18, 19) are not
+  excluded. A bad pin map can brick the device into a re-provisioning
+  loop if the chosen GPIO interferes with boot strapping or with
+  USB-CDC itself. The expectation is that
+  [`slms.grdflo.com`](https://slms.grdflo.com) surfaces sane
+  defaults and warns on suspect picks; the firmware does not police
+  them.
+- **ArduinoJson is linked into the production firmware.** The library
+  is only used by `provision()` but is unconditionally compiled into
+  every build. The flash and RAM cost is a few KB — fine for the C3
+  — but a future `provision`-less build would benefit from gating
+  the dependency.

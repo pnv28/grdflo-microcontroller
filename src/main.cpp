@@ -10,7 +10,7 @@
 #include "mqttManager/mqttManager.h"
 #include "functions/cmnd/cmnd.h"
 #include "functions/stat/stat.h"
-
+#include "provision.h"
 
 esp_task_wdt_config_t wdt_cfg = {
   .timeout_ms     = 30000,
@@ -24,6 +24,7 @@ const unsigned long interval = 60000;
 void setup() {
   statusHandler(STATE_BOOT);
   Serial.begin(115200);
+  Serial.setTxTimeoutMs(0);
 
   Serial.printf("BOOT TIME FREE HEAP: %d\n", ESP.getFreeHeap());
 
@@ -40,6 +41,7 @@ void setup() {
 
 void loop() {
   esp_task_wdt_reset();
+  handleSerialPort();
   unsigned long currMillis = millis();
   // cycleStart = currMillis;
 
@@ -58,7 +60,7 @@ void loop() {
 
   if((currMillis - prevMillis) >= interval) {
     prevMillis = currMillis;
-    Serial.printf("[%lu]Free heap: %d bytes\n", currMillis, ESP.getFreeHeap());
+    Serial.printf("[%lu] Free heap: %d bytes\n", currMillis, ESP.getFreeHeap());
 
     if(globalErrorCounter >= 5) {
       statusHandler(STATE_ERROR);
