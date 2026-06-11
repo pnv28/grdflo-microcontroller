@@ -699,7 +699,7 @@ For a device with `dev_id = GF-B1`, `totalPins = 4`, `pinOffset = 2`
 | `cmnd/GF-B1/light/all` | `"0"` | cloud → device | Every light channel on **this device** OFF |
 | `cmnd/GF-B1/charger/0/cycle` | `"30"` | cloud → device | Charger 0 OFF immediately, ON again 30 s later (payload **must be > 5 s** — see `cmnd/charger/cycle` below) |
 | `cmnd/all/light/all` | `"1"` | cloud → **every device** | Fleet broadcast: every device turns all lights ON |
-| `cmnd/all/light/0` | `"0"` | cloud → **every device** | Every device turns its light index 0 OFF |
+| `cmnd/all/light/0` | `"0"` | cloud → **every device** | Same broadcast effect as `cmnd/all/light/all` — once `segment[1] == "all"` the handler iterates every light channel regardless of `segment[3]`. There is no per-index `all`-target form. |
 | `cmnd/all/charger/...` | (any) | cloud → device | **Explicitly refused** by `cmnd()` — charger broadcasts are not supported |
 | `conf/GF-B1/health` | (ignored) | cloud → device | Force an out-of-cycle `stat/GF-B1/health` publish |
 | `conf/GF-B1/state` | (ignored) | cloud → device | Force a `stat/GF-B1/state` snapshot publish |
@@ -811,10 +811,16 @@ Same payload contract as charger. `light(lightID, state)`:
 
 ### `cmnd/all/light` or `cmnd/<dev_id>/light/all` — broadcast light
 
-Both forms are accepted. The handler iterates `i = 0 .. (totalPins - pinOffset - 1)`
-and calls `light(i, atoi(payload))` for each. If **any** channel returns a
-non-zero status, the final ack is `ok: false`; if all succeeded, `ok: true`.
-There is no equivalent broadcast for the charger group.
+Both forms are accepted. The dispatcher condition is
+`segment[1] == "all" || (seg_len >= 4 && segment[3] == "all")`, so a
+fleet-broadcast topic enters the iteration branch on `segment[1]`
+**regardless of `segment[3]`** — `cmnd/all/light/0`,
+`cmnd/all/light/all`, and `cmnd/all/light/anything-else` are all
+identical in effect (every light channel on every device toggled).
+The handler iterates `i = 0 .. (totalPins - pinOffset - 1)` and calls
+`light(i, atoi(payload))` for each. If **any** channel returns a
+non-zero status, the final ack is `ok: false`; if all succeeded,
+`ok: true`. There is no equivalent broadcast for the charger group.
 
 ### Acknowledgement
 
@@ -1071,7 +1077,8 @@ stateDiagram-v2
     MqttDisconnected --> AllIsWell: auto-reconnect ok
     AllIsWell --> Error: MQTT_EVENT_ERROR
     MqttDisconnected --> Error: MQTT_EVENT_ERROR
-    Error --> [*]: ESP.restart()
+    Error --> AllIsWell: MQTT_EVENT_CONNECTED (transient error recovered)
+    Error --> [*]: ESP.restart() (globalErrorCounter >= 5 at next 60 s tick, WiFi down >= 3 min, or other hard-reboot path)
 ```
 
 ---
@@ -1100,7 +1107,9 @@ Runs once during `setup()` after NVS is read. Sequence:
    silently coming back.
 6. `WiFi.begin(ssid, password)`
 7. Up to 20 retries of 500 ms each (≈10 s total), each iteration
-   printing a `.` to serial as a progress tick.
+   printing a `.` to serial as a progress tick and calling
+   `handleSerialPort()` so the runtime WHOAMI handshake stays
+   responsive even before the WiFi link comes up.
 8. **Post-loop `delay(1000)`** — an extra 1 s grace window after the
    20-attempt loop. The retry loop exits the instant `WL_CONNECTED`
    is observed, but the underlying Arduino WiFi state machine can take
@@ -1209,7 +1218,7 @@ The device hard-reboots (`ESP.restart()`) in any of these conditions:
 
 - WiFi fails to associate within 20 attempts (plus the 1 s post-loop
   grace delay) during boot
-  ([`initWiFiConnection.cpp:24`](src/wifiUtils/initWiFiConnection.cpp:24)).
+  ([`initWiFiConnection.cpp:26`](src/wifiUtils/initWiFiConnection.cpp:26)).
 - WiFi has been disconnected for ≥ 180 000 ms after boot
   ([`main.cpp:58`](src/main.cpp:58)).
 - `esp_mqtt_client_init()` returns `NULL`
@@ -1685,10 +1694,12 @@ The factory route:
 
 These are limitations of **the current code**:
 
-- **`RED_PIN` and `BLUE_PIN` both set to GPIO 21** — the in-source comment
-  in `config.h` reads "*i know it is bricked*" and "*i might have fried gpio
-  pin 21*". The two `pinMode(..., OUTPUT)` calls in `setup()` configure the
-  same physical pin twice; no code path actually drives RED/BLUE today.
+- **`RED_PIN` and `BLUE_PIN` both `#define`d to GPIO 21** — the in-source
+  comment in `config.h` reads "*i know it is bricked*" and "*i might have
+  fried gpio pin 21*". Both macros are dead in the active codebase: no
+  `pinMode` and no `digitalWrite` call sites reference them outside the
+  fully commented-out `cmd.cpp`. They could be deleted without behavioural
+  change.
 - **No NTP.** TLS certificate validity (`notBefore`/`notAfter`) is checked
   against an unsynced system clock, which on cold boot is at the epoch.
 - **Single-slot cycle.** A second `cycle` command overwrites the first

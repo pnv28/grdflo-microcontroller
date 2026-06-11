@@ -1,4 +1,5 @@
 #include "wifiUtils.h"
+#include "provision.h"
 
 void initWiFiConnection(const char *ssid, const char *password) {
     statusHandler(STATE_WIFI_CONNECTING);
@@ -10,6 +11,7 @@ void initWiFiConnection(const char *ssid, const char *password) {
     Serial.println("Trying to connect to WiFi");
     int attempts = 0;
     while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+        handleSerialPort();
         delay(500);
         Serial.print(".");
         attempts++;
